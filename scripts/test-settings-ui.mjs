@@ -15,7 +15,7 @@ const fixture = {
   settings: {
     language: 'zh-CN',
     autostart: false, hideRealIcons: false, quickHide: { enabled: true },
-    showDesktop: 'keepVisible', theme: 'dark', themeStyle: 'fluent', titleAlign: 'left', backdrop: 'acrylic', iconSize: 48,
+    showDesktop: 'keepVisible', theme: 'dark', themeStyle: 'fluent', titleAlign: 'left', textColor: 'adaptive', backdrop: 'acrylic', iconSize: 48,
     icons: { tintRgb: null, tintStrength: 0.6, chameleon: false },
     rollUp: { hoverPeek: true, clickToExpand: false, pushNeighbors: true, titleOnHover: false, hideInactiveScrollbar: false },
     snapping: { enabled: true, gapPx: 8, sizeToCells: false, guideLines: true }, peek: { enabled: true, dim: true, hotkey: 'ctrlAltSpace' },
@@ -482,6 +482,24 @@ async function runTests() {
     assert(sent.prop === 'tint' && sent.value === '0078D4', 'Fence tint swatch did not post setFence');
     assert(doc.querySelector('#fenceTintSwatches [data-value="0078D4"]').getAttribute('aria-checked') === 'true', 'Fence tint swatch not selected after refresh');
     doc.querySelector('#fenceTintSwatches [data-value=""]').click(); await settle();
+  });
+  await test('Text colour shows only with Liquid Glass and is posted', async () => {
+    doc.querySelector('[data-page=general]').click();
+    const card = doc.getElementById('textColorCard');
+    const shown = () => frame.contentWindow.getComputedStyle(card).display !== 'none';
+    assert(!shown(), 'Text colour shown with Fluent');
+    styleRadio(doc, 'liquidGlass').click(); await settle();
+    assert(shown(), 'Text colour hidden with Liquid Glass');
+    const color = doc.querySelector('[data-bind=textColor]');
+    assert(color.value === 'adaptive', 'Saved text colour not shown');
+    for (const value of ['perFence', 'light', 'dark', 'adaptive']) {
+      color.value = value;
+      color.dispatchEvent(new frame.contentWindow.Event('change', { bubbles: true }));
+      await settle();
+      assert(current().settings.textColor === value, 'Text colour not posted: ' + value);
+    }
+    styleRadio(doc, 'fluent').click(); await settle();
+    assert(!shown(), 'Text colour still shown after switching back to Fluent');
   });
   await test('Title alignment is posted and previewed; fully transparent fences show their preset', async () => {
     doc.querySelector('[data-page=general]').click();

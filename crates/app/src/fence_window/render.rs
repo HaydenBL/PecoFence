@@ -97,24 +97,27 @@ impl FenceViewState {
         if self.theme.liquid_glass && self.gpu_glass.borrow().failed() {
             return self.theme;
         }
+        // 文字颜色 is a Liquid Glass setting; Fluent keeps its own ink.
+        let theme = if self.theme.liquid_glass {
+            self.theme.with_text_color(self.behavior.text_color.get())
+        } else {
+            self.theme
+        };
         match &self.backdrop_crop {
             Some(image) if self.is_clear() => {
                 // Captions sit on bare wallpaper at rest, on the default plate while hovered.
                 let foreground =
-                    self.theme
-                        .over_clear_plate(image, self.style.tint, self.glass_dark_text.get());
+                    theme.over_clear_plate(image, self.style.tint, self.glass_dark_text.get());
                 self.glass_dark_text
                     .set(Some(foreground.text_primary.r < 0.5));
                 foreground
             }
-            None if self.is_clear() => Theme {
-                text_halo: true,
-                ..self.theme
-            },
+            None if self.is_clear() => {
+                theme.over_clear_plate(&pecofence_render::Image::default(), self.style.tint, None)
+            }
             Some(image) if self.theme.liquid_glass => {
                 // The GPU renders a complete wallpaper-backed material, so floating
                 // fences do not expose application text through a transparent centre.
-                let theme = self.theme;
                 let foreground = theme.over_glass_with_previous_ink(
                     image,
                     self.material_opacity(),

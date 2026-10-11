@@ -124,6 +124,8 @@ pub struct Behavior {
     pub title_on_hover: std::cell::Cell<bool>,
     /// Title (or tab strip) position in the title row (`titleAlign`).
     pub title_align: std::cell::Cell<pecofence_core::TitleAlign>,
+    /// Where adaptive text takes its colour from (`textColor`).
+    pub text_color: std::cell::Cell<pecofence_core::TextColor>,
     /// Scrollbar drawn only while hovered / shortly after scrolling.
     pub hide_inactive_scrollbar: std::cell::Cell<bool>,
     /// `SPI_GETWHEELSCROLLLINES`: rows per wheel notch; `u32::MAX` (`WHEEL_PAGESCROLL`) = one
