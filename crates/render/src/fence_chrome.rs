@@ -522,7 +522,8 @@ fn header_foreground(
     opacity: f32,
     tint: Option<ColorF>,
 ) -> Theme {
-    if theme.text_color == pecofence_core::TextColor::PerFence {
+    // Only the default 文字颜色 picks ink per piece of text; the others already chose it.
+    if theme.text_color != pecofence_core::TextColor::Adaptive {
         return *theme;
     }
     if let Backdrop::GpuGlass {
@@ -2019,7 +2020,9 @@ impl FenceChrome {
         let secondary = session.create_solid_brush(theme.text_secondary)?;
         let cols = rows.columns;
         let header_h = rows.header_h;
-        let halo = if theme.liquid_glass || theme.text_halo {
+        let halo = if (theme.liquid_glass || theme.text_halo)
+            && text_shadow(theme, theme.text_primary).is_none()
+        {
             Some(session.create_solid_brush(ColorF::TRANSPARENT)?)
         } else {
             None
@@ -2388,7 +2391,9 @@ impl FenceChrome {
         if !content.group_headers.is_empty() {
             let line = session.create_solid_brush(theme.stroke)?;
             // The same local halo the labels get over mixed wallpaper.
-            let halo = if theme.liquid_glass || theme.text_halo {
+            let halo = if (theme.liquid_glass || theme.text_halo)
+                && text_shadow(theme, theme.text_secondary).is_none()
+            {
                 Some(session.create_solid_brush(if theme.text_secondary.r > 0.5 {
                     ColorF::new(0.0, 0.0, 0.0, 0.28)
                 } else {

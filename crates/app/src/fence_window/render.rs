@@ -128,7 +128,8 @@ impl FenceViewState {
                     .set(Some(foreground.text_primary.r < 0.5));
                 foreground
             }
-            _ => self.theme,
+            // No wallpaper sample yet: a fixed 文字颜色 still applies (Fluent comes back as is).
+            _ => theme.over_glass(&pecofence_render::Image::default()),
         }
     }
 
