@@ -635,6 +635,7 @@ impl App {
             .title_on_hover
             .set(new.roll_up.title_on_hover);
         self.ctx.behavior.title_align.set(new.title_align);
+        self.ctx.behavior.text_color.set(new.text_color);
         self.ctx
             .behavior
             .hide_inactive_scrollbar
@@ -646,6 +647,7 @@ impl App {
         // The rows fill the height only with 「调整大小时按整行整列对齐」 on: relay them out.
         let chrome_changed = new.roll_up.title_on_hover != old.roll_up.title_on_hover
             || new.title_align != old.title_align
+            || new.text_color != old.text_color
             || new.roll_up.hide_inactive_scrollbar != old.roll_up.hide_inactive_scrollbar
             || new.snapping.size_to_cells != old.snapping.size_to_cells;
         if chrome_changed {

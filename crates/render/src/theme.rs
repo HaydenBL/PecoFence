@@ -69,6 +69,8 @@ pub struct Theme {
     /// Captions sit on bare wallpaper (a fully transparent plate): titles, tabs and labels
     /// get the legibility halo Liquid Glass labels always have.
     pub text_halo: bool,
+    /// The 文字颜色 setting: where adaptive text takes its colour from.
+    pub text_color: pecofence_core::TextColor,
 }
 
 impl Theme {
@@ -102,6 +104,7 @@ impl Theme {
             corner_radius: 8.0,
             title_height: 36.0,
             text_halo: false,
+            text_color: pecofence_core::TextColor::Adaptive,
         }
     }
 
@@ -135,6 +138,7 @@ impl Theme {
             corner_radius: 8.0,
             title_height: 36.0,
             text_halo: false,
+            text_color: pecofence_core::TextColor::Adaptive,
         }
     }
 
@@ -286,7 +290,13 @@ impl Theme {
         tint: Option<ColorF>,
         previous_dark_text: Option<bool>,
     ) -> Self {
-        if !self.liquid_glass || image.bgra.is_empty() {
+        if !self.liquid_glass {
+            return self;
+        }
+        if let Some(fixed) = self.with_fixed_ink() {
+            return fixed;
+        }
+        if image.bgra.is_empty() {
             return self;
         }
         let foreground = if self.prefers_dark_text(image, opacity, tint, previous_dark_text) {
@@ -323,7 +333,9 @@ impl Theme {
     }
 
     /// Whether dark text reads better over `image` once the plate's own layers (glass layer,
-    /// opacity veil, tint wash) are composited over it.
+    /// opacity veil, tint wash) are composited over it. One colour for a whole fence (按栅栏自动)
+    /// judges by its darkest quarter: white text with its shadow survives pale sky far better
+    /// than dark text survives trees.
     fn prefers_dark_text(
         &self,
         image: &crate::Image,
@@ -331,8 +343,7 @@ impl Theme {
         tint: Option<ColorF>,
         previous_dark_text: Option<bool>,
     ) -> bool {
-        let mut sum = 0.0;
-        let mut count = 0;
+        let mut samples = Vec::with_capacity(256);
         let (cols, rows) = (image.width.min(16), image.height.min(16));
         for row in 0..rows {
             for col in 0..cols {
@@ -340,12 +351,17 @@ impl Theme {
                 let y = ((2 * row + 1) * image.height / (2 * rows)).min(image.height - 1);
                 let i = ((y * image.width + x) * 4) as usize;
                 let p = &image.bgra[i..i + 4];
-                sum += (0.2126 * p[2] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[0] as f32) / 255.0;
-                count += 1;
+                samples.push(
+                    (0.2126 * p[2] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[0] as f32) / 255.0,
+                );
             }
         }
+        if self.text_color == pecofence_core::TextColor::PerFence {
+            samples.sort_by(f32::total_cmp);
+            samples.truncate(samples.len().div_ceil(4));
+        }
         let luminance = |c: ColorF| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-        let mut brightness = sum / count.max(1) as f32;
+        let mut brightness = samples.iter().sum::<f32>() / samples.len().max(1) as f32;
         let layer = if self.liquid_glass {
             self.liquid_level(opacity).fill
         } else {
@@ -369,6 +385,21 @@ impl Theme {
             None => 0.56,
         };
         brightness > threshold
+    }
+
+    pub fn with_text_color(mut self, text_color: pecofence_core::TextColor) -> Self {
+        self.text_color = text_color;
+        self
+    }
+
+    /// The ink a fixed 文字颜色 (white or dark) asks for, ignoring the backdrop.
+    fn with_fixed_ink(self) -> Option<Self> {
+        let mode = match self.text_color {
+            pecofence_core::TextColor::Light => ThemeMode::Dark,
+            pecofence_core::TextColor::Dark => ThemeMode::Light,
+            _ => return None,
+        };
+        Some(self.with_ink_of(Self::for_mode(mode).with_liquid_glass()))
     }
 
     /// Takes the text and control-feedback tokens of `foreground`; material, accent and
@@ -654,6 +685,37 @@ mod tests {
         assert_eq!(lerp(a, b, 2.0), b);
         let h = with_alpha(ColorF::from_rgba8(1, 2, 3, 0x80), 0.5);
         assert!((h.a - 0x80 as f32 / 255.0 * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_fixed_text_color_ignores_the_backdrop_and_per_fence_still_adapts() {
+        use pecofence_core::TextColor;
+        let bright = crate::Image::solid(16, 16, [240; 3]);
+        let dim = crate::Image::solid(16, 16, [20; 3]);
+        for mode in [ThemeMode::Light, ThemeMode::Dark] {
+            let glass = Theme::for_mode(mode).with_liquid_glass();
+            let white = glass.with_text_color(TextColor::Light);
+            let ink = glass.with_text_color(TextColor::Dark);
+            for image in [&bright, &dim] {
+                assert!(white.over_glass(image).text_primary.r > 0.9);
+                assert!(ink.over_glass(image).text_primary.r < 0.2);
+                assert!(white.over_clear_plate(image, None, None).text_primary.r > 0.9);
+            }
+            assert!(white.over_glass(&crate::Image::default()).text_primary.r > 0.9);
+            // Fluent plates keep the mode's ink.
+            let fluent = Theme::for_mode(mode).with_text_color(TextColor::Light);
+            assert_eq!(fluent.over_glass(&bright).text_primary, fluent.text_primary);
+            let per_fence = glass.with_text_color(TextColor::PerFence);
+            assert!(per_fence.over_glass(&bright).text_primary.r < 0.2);
+            assert!(per_fence.over_glass(&dim).text_primary.r > 0.9);
+            // Mostly sky with a band of trees: the average says dark text, the trees say white.
+            let mut mixed = crate::Image::solid(16, 16, [240; 3]);
+            for px in mixed.bgra.chunks_mut(4).skip(16 * 11) {
+                px[..3].copy_from_slice(&[30; 3]);
+            }
+            assert!(glass.over_glass(&mixed).text_primary.r < 0.2);
+            assert!(per_fence.over_glass(&mixed).text_primary.r > 0.9);
+        }
     }
 }
 #[test]

@@ -288,6 +288,7 @@
      rounder geometry and a top highlight echo the material. */
   :root.liquid-glass { --r-card: 8px; --r-control: 6px; --glass-highlight: #ffffff12; }
   :root.liquid-glass.light { --glass-highlight: #ffffffe6; }
+  :root:not(.liquid-glass) #textColorCard { display: none; }
   @media (prefers-reduced-transparency: reduce) {
     .tile .mini-fence { backdrop-filter: none; background: var(--card); }
     .preview-glass { display: none; }
@@ -338,6 +339,8 @@
         <select data-bind="theme"><option value="followWindowsMode">跟随 Windows 模式</option><option value="followAppMode">跟随应用模式</option><option value="light">浅色</option><option value="dark">深色</option></select></div>
       <div class="card"><div class="l"><span class="ic">&#xE8E4;</span><div><div class="t">标题对齐</div></div></div>
         <select data-bind="titleAlign"><option value="left">左对齐</option><option value="center">居中</option><option value="right">右对齐</option></select></div>
+      <div class="card" id="textColorCard"><div class="l"><span class="ic">&#xE8D2;</span><div><div class="t">文字颜色</div><div class="s">液态玻璃和全透明栅栏的标题与图标文字</div></div></div>
+        <select data-bind="textColor"><option value="adaptive">自动（随背景变化）</option><option value="perFence">按栅栏自动</option><option value="light">白色</option><option value="dark">黑色</option></select></div>
       <div class="card"><div class="l"><span class="ic">&#xE8B9;</span><div><div class="t">默认图标大小</div><div class="s">新建栅栏时使用，每个栅栏可在“栅栏”页或右键菜单中单独设置</div></div></div>
         <select data-bind="iconSize"><option value="32">小图标</option><option value="48">中等图标</option><option value="64">较大图标</option><option value="96">大图标</option></select></div>
       <div class="group">
