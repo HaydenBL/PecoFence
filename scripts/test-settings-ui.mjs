@@ -15,7 +15,7 @@ const fixture = {
   settings: {
     language: 'zh-CN',
     autostart: false, hideRealIcons: false, hideInboxWhenIconsShown: false, offerNewFence: true, quickHide: { enabled: true },
-    showDesktop: 'keepVisible', theme: 'dark', themeStyle: 'fluent', labelColor: 'auto', textColor: 'adaptive', titleAlign: 'left', tabBar: 'top', backdrop: 'acrylic', iconSize: 48,
+    showDesktop: 'keepVisible', theme: 'dark', themeStyle: 'fluent', labelColor: 'auto', titleAlign: 'left', tabBar: 'top', backdrop: 'acrylic', iconSize: 48,
     icons: { tintRgb: null, tintStrength: 0.6, chameleon: false, shortcutArrows: true },
     rollUp: { hoverPeek: true, clickToExpand: false, pushNeighbors: true, titleOnHover: false, hideInactiveScrollbar: false, switchTabOnHover: false, hideCountAndChevron: false },
     snapping: { enabled: true, gapPx: 8, sizeToCells: false, guideLines: true }, peek: { enabled: true, dim: true, hotkey: 'ctrlAltSpace' },
@@ -570,24 +570,6 @@ async function runTests() {
     assert(doc.querySelector('#fenceTintSwatches [data-value="0078D4"]').getAttribute('aria-checked') === 'true', 'Fence tint swatch not selected after refresh');
     doc.querySelector('#fenceTintSwatches [data-value=""]').click(); await settle();
   });
-  await test('Text colour shows only with Liquid Glass and is posted', async () => {
-    doc.querySelector('[data-page=general]').click();
-    const card = doc.getElementById('textColorCard');
-    const shown = () => frame.contentWindow.getComputedStyle(card).display !== 'none';
-    assert(!shown(), 'Text colour shown with Fluent');
-    styleRadio(doc, 'liquidGlass').click(); await settle();
-    assert(shown(), 'Text colour hidden with Liquid Glass');
-    const color = doc.querySelector('[data-bind=textColor]');
-    assert(color.value === 'adaptive', 'Saved text colour not shown');
-    for (const value of ['perFence', 'light', 'dark', 'adaptive']) {
-      color.value = value;
-      color.dispatchEvent(new frame.contentWindow.Event('change', { bubbles: true }));
-      await settle();
-      assert(current().settings.textColor === value, 'Text colour not posted: ' + value);
-    }
-    styleRadio(doc, 'fluent').click(); await settle();
-    assert(!shown(), 'Text colour still shown after switching back to Fluent');
-  });
   await test('Title alignment is posted and previewed; fully transparent fences show their preset', async () => {
     doc.querySelector('[data-page=general]').click();
     const align = doc.querySelector('[data-bind=titleAlign]');
@@ -620,16 +602,23 @@ async function runTests() {
       assert(current().settings.tabBar === value, 'Tab bar position not posted: ' + value);
     }
   });
-  await test('Icon name colour is shown and posted', async () => {
+  await test('Text colour is shown and posted; per fence only with Liquid Glass', async () => {
     doc.querySelector('[data-page=general]').click();
     const color = doc.querySelector('[data-bind=labelColor]');
-    assert(color.value === 'auto', 'Saved icon name colour not shown');
-    for (const value of ['white', 'black', 'auto']) {
+    assert(color.value === 'auto', 'Saved text colour not shown');
+    const perFence = color.querySelector('option[value=perFence]');
+    const shown = () => frame.contentWindow.getComputedStyle(perFence).display !== 'none';
+    assert(!shown(), 'Per fence offered with Fluent');
+    styleRadio(doc, 'liquidGlass').click(); await settle();
+    assert(shown(), 'Per fence hidden with Liquid Glass');
+    for (const value of ['perFence', 'white', 'black', 'auto']) {
       color.value = value;
       color.dispatchEvent(new frame.contentWindow.Event('change', { bubbles: true }));
       await settle();
-      assert(current().settings.labelColor === value, 'Icon name colour not posted: ' + value);
+      assert(current().settings.labelColor === value, 'Text colour not posted: ' + value);
     }
+    styleRadio(doc, 'fluent').click(); await settle();
+    assert(!shown(), 'Per fence still offered after switching back to Fluent');
   });
   await test('Rule rows are compact and the new-rule form opens when needed', async () => {
     doc = await reset();

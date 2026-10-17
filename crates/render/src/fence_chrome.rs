@@ -680,7 +680,7 @@ fn header_foreground(
     tint: Option<ColorF>,
 ) -> Theme {
     // Only the default 文字颜色 picks ink per piece of text; the others already chose it.
-    if theme.text_color != pecofence_core::TextColor::Adaptive {
+    if theme.label_color != pecofence_core::LabelColor::Auto {
         return *theme;
     }
     if let Backdrop::GpuGlass {
@@ -985,7 +985,7 @@ struct TextShadow {
 }
 
 fn text_shadow(theme: &Theme, ink: ColorF) -> Option<TextShadow> {
-    if theme.text_color == pecofence_core::TextColor::Adaptive || !theme.liquid_glass {
+    if theme.label_color == pecofence_core::LabelColor::Auto {
         return None;
     }
     Some(if ink.r > 0.5 {

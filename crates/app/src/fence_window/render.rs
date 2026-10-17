@@ -94,16 +94,14 @@ impl FenceViewState {
 
     /// Adapt content to the clear plate instead of darkening the whole wallpaper.
     pub(super) fn material_foreground(&self) -> Theme {
+        let label_color = self.behavior.label_color.get();
+        let theme = self.theme.with_label_color(label_color);
         if self.theme.liquid_glass && self.gpu_glass.borrow().failed() {
-            return self.theme;
+            return theme;
         }
-        // 文字颜色 is a Liquid Glass setting; Fluent keeps its own ink.
-        let theme = if self.theme.liquid_glass {
-            self.theme.with_text_color(self.behavior.text_color.get())
-        } else {
-            self.theme
-        };
-        match &self.backdrop_crop {
+        // The pickers choose the ink and plate feedback for the backdrop; a fixed 文字颜色 then
+        // takes over the text, after the hysteresis noted the backdrop's own choice.
+        let picked = match &self.backdrop_crop {
             Some(image) if self.is_clear() => {
                 // Captions sit on bare wallpaper at rest, on the default plate while hovered.
                 let foreground =
@@ -128,9 +126,9 @@ impl FenceViewState {
                     .set(Some(foreground.text_primary.r < 0.5));
                 foreground
             }
-            // No wallpaper sample yet: a fixed 文字颜色 still applies (Fluent comes back as is).
-            _ => theme.over_glass(&pecofence_render::Image::default()),
-        }
+            _ => theme,
+        };
+        picked.with_label_color(label_color)
     }
 
     /// Drops the per-item fades: the view now shows a different list (tab switch, layout

@@ -777,7 +777,6 @@ impl App {
         self.ctx.behavior.title_align.set(new.title_align);
         self.ctx.behavior.tab_bar.set(new.tab_bar);
         self.ctx.behavior.label_color.set(new.label_color);
-        self.ctx.behavior.text_color.set(new.text_color);
         self.ctx
             .behavior
             .hide_inactive_scrollbar
@@ -794,7 +793,6 @@ impl App {
         let chrome_changed = new.roll_up.title_on_hover != old.roll_up.title_on_hover
             || new.title_align != old.title_align
             || new.label_color != old.label_color
-            || new.text_color != old.text_color
             || new.roll_up.hide_inactive_scrollbar != old.roll_up.hide_inactive_scrollbar
             || new.roll_up.hide_count_and_chevron != old.roll_up.hide_count_and_chevron
             || new.snapping.size_to_cells != old.snapping.size_to_cells;

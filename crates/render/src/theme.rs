@@ -69,8 +69,8 @@ pub struct Theme {
     /// Captions sit on bare wallpaper (a fully transparent plate): titles, tabs and labels
     /// get the legibility halo Liquid Glass labels always have.
     pub text_halo: bool,
-    /// The 文字颜色 setting: where adaptive text takes its colour from.
-    pub text_color: pecofence_core::TextColor,
+    /// The 文字颜色 setting the text was drawn for.
+    pub label_color: pecofence_core::LabelColor,
 }
 
 impl Theme {
@@ -104,7 +104,7 @@ impl Theme {
             corner_radius: 8.0,
             title_height: 36.0,
             text_halo: false,
-            text_color: pecofence_core::TextColor::Adaptive,
+            label_color: pecofence_core::LabelColor::Auto,
         }
     }
 
@@ -138,7 +138,7 @@ impl Theme {
             corner_radius: 8.0,
             title_height: 36.0,
             text_halo: false,
-            text_color: pecofence_core::TextColor::Adaptive,
+            label_color: pecofence_core::LabelColor::Auto,
         }
     }
 
@@ -293,9 +293,6 @@ impl Theme {
         if !self.liquid_glass {
             return self;
         }
-        if let Some(fixed) = self.with_fixed_ink() {
-            return fixed;
-        }
         if image.bgra.is_empty() {
             return self;
         }
@@ -356,7 +353,7 @@ impl Theme {
                 );
             }
         }
-        if self.text_color == pecofence_core::TextColor::PerFence {
+        if self.label_color == pecofence_core::LabelColor::PerFence {
             samples.sort_by(f32::total_cmp);
             samples.truncate(samples.len().div_ceil(4));
         }
@@ -387,27 +384,15 @@ impl Theme {
         brightness > threshold
     }
 
-    pub fn with_text_color(mut self, text_color: pecofence_core::TextColor) -> Self {
-        self.text_color = text_color;
-        self
-    }
-
-    /// The ink a fixed 文字颜色 (white or dark) asks for, ignoring the backdrop.
-    fn with_fixed_ink(self) -> Option<Self> {
-        let mode = match self.text_color {
-            pecofence_core::TextColor::Light => ThemeMode::Dark,
-            pecofence_core::TextColor::Dark => ThemeMode::Light,
-            _ => return None,
-        };
-        Some(self.with_ink_of(Self::for_mode(mode).with_liquid_glass()))
-    }
-
-    /// The theme the item names are drawn with. 「图标名称颜色」 白色 / 黑色 takes the text of
-    /// this material's dark / light theme whatever the backdrop; the plate, hover and focus
-    /// tokens stay as picked for it, and the halo follows the text.
+    /// The theme the text is drawn with. 「文字颜色」 白色 / 黑色 takes the text of this
+    /// material's dark / light theme whatever the backdrop; the plate, hover and focus tokens
+    /// stay as picked for it. 按栅栏自动 is kept for the ink pickers to read.
     pub fn with_label_color(mut self, color: pecofence_core::LabelColor) -> Self {
+        self.label_color = color;
         let mode = match color {
-            pecofence_core::LabelColor::Auto => return self,
+            pecofence_core::LabelColor::Auto | pecofence_core::LabelColor::PerFence => {
+                return self;
+            }
             pecofence_core::LabelColor::White => ThemeMode::Dark,
             pecofence_core::LabelColor::Black => ThemeMode::Light,
         };
@@ -734,24 +719,14 @@ mod tests {
     }
 
     #[test]
-    fn a_fixed_text_color_ignores_the_backdrop_and_per_fence_still_adapts() {
-        use pecofence_core::TextColor;
-        let bright = crate::Image::solid(16, 16, [240; 3]);
-        let dim = crate::Image::solid(16, 16, [20; 3]);
+    fn per_fence_text_judges_by_the_darkest_quarter() {
+        use pecofence_core::LabelColor;
         for mode in [ThemeMode::Light, ThemeMode::Dark] {
             let glass = Theme::for_mode(mode).with_liquid_glass();
-            let white = glass.with_text_color(TextColor::Light);
-            let ink = glass.with_text_color(TextColor::Dark);
-            for image in [&bright, &dim] {
-                assert!(white.over_glass(image).text_primary.r > 0.9);
-                assert!(ink.over_glass(image).text_primary.r < 0.2);
-                assert!(white.over_clear_plate(image, None, None).text_primary.r > 0.9);
-            }
-            assert!(white.over_glass(&crate::Image::default()).text_primary.r > 0.9);
-            // Fluent plates keep the mode's ink.
-            let fluent = Theme::for_mode(mode).with_text_color(TextColor::Light);
-            assert_eq!(fluent.over_glass(&bright).text_primary, fluent.text_primary);
-            let per_fence = glass.with_text_color(TextColor::PerFence);
+            let per_fence = glass.with_label_color(LabelColor::PerFence);
+            assert_eq!(per_fence.text_primary, glass.text_primary);
+            let bright = crate::Image::solid(16, 16, [240; 3]);
+            let dim = crate::Image::solid(16, 16, [20; 3]);
             assert!(per_fence.over_glass(&bright).text_primary.r < 0.2);
             assert!(per_fence.over_glass(&dim).text_primary.r > 0.9);
             // Mostly sky with a band of trees: the average says dark text, the trees say white.

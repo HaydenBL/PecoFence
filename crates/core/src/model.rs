@@ -96,7 +96,8 @@ pub struct Settings {
     /// Material style is independent of the light/dark preference.
     #[serde(default)]
     pub theme_style: ThemeStyle,
-    /// Colour of the item names in every fence; fence titles have their own `titleColor`.
+    /// Colour of the titles, tabs and item names in every fence; a fence's own `titleColor`
+    /// still wins for its title.
     #[serde(default)]
     pub label_color: LabelColor,
     /// Where every fence's title (or tab strip) sits in its title row.
@@ -105,9 +106,6 @@ pub struct Settings {
     /// Where a fence with two or more tabs shows them.
     #[serde(default)]
     pub tab_bar: TabBar,
-    /// Text colour on Liquid Glass fences (Fluent follows the colour mode).
-    #[serde(default)]
-    pub text_color: TextColor,
     pub icon_size: u32,
     pub quick_hide: QuickHideSettings,
     pub roll_up: RollUpSettings,
@@ -223,7 +221,6 @@ impl Default for Settings {
             label_color: LabelColor::Auto,
             title_align: TitleAlign::Left,
             tab_bar: TabBar::Top,
-            text_color: TextColor::Adaptive,
             icon_size: 48,
             quick_hide: QuickHideSettings::default(),
             roll_up: RollUpSettings::default(),
@@ -271,14 +268,17 @@ pub enum ThemeStyle {
     LiquidGlass,
 }
 
-/// Item name colour (「图标名称颜色」). Auto: Liquid Glass picks dark or light text from the
-/// wallpaper under each fence, Fluent follows the colour mode. The halo pairs with the text.
+/// Text colour (「文字颜色」). Auto: Liquid Glass picks dark or light text from the wallpaper,
+/// for the item names under each fence and for each tab and title under it, and Fluent follows
+/// the colour mode; the halo pairs with the text. Anything else swaps the halo for a soft shadow.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum LabelColor {
     #[default]
     Auto,
+    /// One colour for a fence's title, tabs and item names, chosen from its backdrop.
+    PerFence,
     White,
     Black,
 }
@@ -293,21 +293,6 @@ pub enum TitleAlign {
     Left,
     Center,
     Right,
-}
-
-/// Where Liquid Glass fences take their text colour from. Anything but
-/// `Adaptive` also swaps the outline halo for a soft shadow.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(rename_all = "camelCase")]
-pub enum TextColor {
-    /// Labels follow the backdrop of their fence, tabs and titles the area under them.
-    #[default]
-    Adaptive,
-    /// One colour per fence, chosen from its backdrop.
-    PerFence,
-    Light,
-    Dark,
 }
 
 /// Where a tabbed fence shows its tabs: side by side in the title row, or listed in a column
@@ -1669,13 +1654,11 @@ mod tests {
         json.as_object_mut().unwrap().remove("titleAlign");
         json.as_object_mut().unwrap().remove("tabBar");
         json.as_object_mut().unwrap().remove("labelColor");
-        json.as_object_mut().unwrap().remove("textColor");
         let legacy: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.theme_style, ThemeStyle::Fluent);
         assert_eq!(legacy.title_align, TitleAlign::Left);
         assert_eq!(legacy.tab_bar, TabBar::Top);
         assert_eq!(legacy.label_color, LabelColor::Auto);
-        assert_eq!(legacy.text_color, TextColor::Adaptive);
         for mode in [
             ThemeSetting::Light,
             ThemeSetting::Dark,

@@ -129,10 +129,8 @@ pub struct Behavior {
     pub title_align: std::cell::Cell<pecofence_core::TitleAlign>,
     /// Tabs in the title row or in a column on the left (`tabBar`).
     pub tab_bar: std::cell::Cell<pecofence_core::TabBar>,
-    /// Item names in the backdrop's ink or always white / black (`labelColor`).
+    /// Text in the backdrop's ink, one ink per fence or always white / black (`labelColor`).
     pub label_color: std::cell::Cell<pecofence_core::LabelColor>,
-    /// Where adaptive text takes its colour from (`textColor`).
-    pub text_color: std::cell::Cell<pecofence_core::TextColor>,
     /// Scrollbar drawn only while hovered / shortly after scrolling.
     pub hide_inactive_scrollbar: std::cell::Cell<bool>,
     /// Resting the pointer on another tab switches to it (`rollUp.switchTabOnHover`).
