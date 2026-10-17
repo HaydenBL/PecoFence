@@ -28,7 +28,7 @@ fn window_drag_keeps_the_latest_sample_and_release_before_first_frame() {
         offset: (20, 10),
         offset_dpi: 96,
         merge_target: 0,
-        merge_x: i32::MIN,
+        merge_at: (i32::MIN, i32::MIN),
         moved_once: false,
         origin: WindowDragOrigin::Caption {
             rect: RECT::default(),
@@ -241,6 +241,21 @@ fn merge_slot_on_drawn_strip_is_stable() {
     );
 }
 
+/// A merge into a left tab column collapsed to fit its rows opens one row: the rows shrink by a
+/// quarter for three tabs, where a title-row-wide gap would halve them.
+#[test]
+fn merge_gap_in_left_column_is_one_row() {
+    let rows = [RAIL_ROW_H; 3];
+    let fit = 3.0 * RAIL_ROW_H + 2.0 * TAB_GAP;
+    let drawn = tab_strip_rects_with(&rows, Some((1, RAIL_ROW_H)), fit);
+    assert_eq!(drawn.len(), 3);
+    for (_, h) in &drawn {
+        assert!(*h > RAIL_ROW_H * 0.7, "row squeezed to {h}");
+    }
+    // The second row moves down past the gap.
+    assert!(drawn[1].0 > drawn[0].0 + drawn[0].1 + RAIL_ROW_H * 0.7);
+}
+
 /// The shell's stack + count badge takes over for large footprints; small ones lift off in
 /// place.
 #[test]
@@ -250,6 +265,15 @@ fn drag_image_footprint_limit() {
     assert!(!drag_image_fits(321.0, 100.0));
     assert!(!drag_image_fits(100.0, 400.0));
     assert_eq!(DRAG_IMAGE_MAX_ITEMS, 4);
+}
+
+/// A fence collapsed to its left tab column keeps no room for the chevron under the tabs: two
+/// tabs take 84 DIP instead of the expanded column's 120.
+#[test]
+fn collapsed_tab_column_has_no_chevron_room() {
+    assert_eq!(rail_len_for(2, RAIL_BOTTOM), 120.0);
+    assert_eq!(rail_len_for(2, RAIL_COLLAPSED_BOTTOM), 84.0);
+    assert_eq!(rail_len_for(3, RAIL_COLLAPSED_BOTTOM), 120.0);
 }
 
 #[test]
@@ -268,6 +292,46 @@ fn narrow_tab_strips_cannot_cover_the_chevron_or_count() {
             }
         }
     }
+}
+
+/// A scrolled title-row strip keeps every pill at its natural width, `TAB_GAP` apart, and the
+/// merge gap opens a slot in it.
+#[test]
+fn scrolled_strip_keeps_natural_widths() {
+    let natural = [80.0, 60.0, 100.0];
+    assert_eq!(tab_strip_span(&natural, None), 240.0 + 2.0 * TAB_GAP);
+    assert_eq!(
+        tab_strip_span(&natural, Some((1, TAB_MERGE_GAP_W))),
+        240.0 + TAB_MERGE_GAP_W + 3.0 * TAB_GAP
+    );
+    let rects = tab_strip_scrolled(&natural, None, 30.0);
+    assert_eq!(
+        rects,
+        vec![
+            (TAB_LEFT - 30.0, 80.0),
+            (TAB_LEFT + 54.0, 60.0),
+            (TAB_LEFT + 118.0, 100.0)
+        ]
+    );
+    let gapped = tab_strip_scrolled(&natural, Some((1, TAB_MERGE_GAP_W)), 0.0);
+    assert_eq!(gapped[1].0, TAB_LEFT + 84.0 + TAB_MERGE_GAP_W + TAB_GAP);
+}
+
+/// The strip scrolls only as far as needed to show the active pill clear of the fades, and
+/// never past its ends.
+#[test]
+fn strip_scrolls_just_enough_to_show_the_active_tab() {
+    let m = TAB_SCROLL_MARGIN;
+    // 200 DIPs of room over a 500 DIP strip: at most 300 of scroll.
+    assert_eq!(scroll_to_show(0.0, 50.0, 80.0, 200.0, 300.0), 0.0);
+    assert_eq!(scroll_to_show(0.0, 250.0, 80.0, 200.0, 300.0), 130.0 + m);
+    assert_eq!(scroll_to_show(170.0, 160.0, 80.0, 200.0, 300.0), 160.0 - m);
+    // At the strip's ends there is nothing to keep room for.
+    assert_eq!(scroll_to_show(0.0, 10.0, 80.0, 200.0, 300.0), 0.0);
+    assert_eq!(scroll_to_show(130.0, 420.0, 80.0, 200.0, 300.0), 300.0);
+    // A room too narrow for both margins centres the pill.
+    assert_eq!(scroll_to_show(0.0, 100.0, 80.0, 120.0, 300.0), 80.0);
+    assert_eq!(scroll_to_show(0.0, 100.0, 250.0, 200.0, 300.0), 125.0);
 }
 /// Right-drag menu offers only what both the source and this target can do, in Explorer's
 /// order.

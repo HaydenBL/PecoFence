@@ -400,7 +400,12 @@ impl App {
 
     pub(super) fn set_fence_title_icon(&mut self, fence: FenceId, show: bool) {
         self.state.set_hide_title_icon(fence, !show);
-        self.apply_portal_deco(self.state.host_of(fence));
+        let host = self.state.host_of(fence);
+        // The tab pills carry the glyph too: push the strip so they follow at once.
+        if let Some(w) = self.fences.get(&host) {
+            w.set_tabs(self.tab_views(host), self.state.active_tab_of(host));
+        }
+        self.apply_portal_deco(host);
         self.schedule_save();
     }
 
@@ -415,16 +420,17 @@ impl App {
 
     /// Opens the settings window on the 「栅栏」 page with `fence` selected.
     pub(super) fn open_fence_options(&mut self, fence: FenceId) {
-        let already_open = self.settings.is_some();
         self.open_settings();
-        if self.settings.is_none() {
+        let Some(host) = &self.settings else {
             return;
-        }
-        if already_open {
+        };
+        if host.ready {
             self.post_show_fence(fence);
         } else {
-            // The page is still loading; `ready` delivers the state and then this.
+            // The page is still loading; `ready` delivers the state and then the latest
+            // request: this fence, or the feedback form.
             self.settings_focus_fence = Some(fence);
+            self.feedback.focus = None;
         }
     }
 

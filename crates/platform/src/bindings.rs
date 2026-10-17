@@ -606,6 +606,21 @@ pub unsafe fn FillRect(hdc: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32 {
     unsafe { FillRect(hdc, lprc, hbr) }
 }
 #[inline]
+pub unsafe fn FindResourceW<P1, P2>(hmodule: Option<HMODULE>, lpname: P1, lptype: P2) -> HRSRC
+where
+    P1: windows_core::Param<windows_core::PCWSTR>,
+    P2: windows_core::Param<windows_core::PCWSTR>,
+{
+    windows_core::link!("kernel32.dll" "system" fn FindResourceW(hmodule : HMODULE, lpname : windows_core::PCWSTR, lptype : windows_core::PCWSTR) -> HRSRC);
+    unsafe {
+        FindResourceW(
+            hmodule.unwrap_or(core::mem::zeroed()) as _,
+            lpname.param().abi(),
+            lptype.param().abi(),
+        )
+    }
+}
+#[inline]
 pub unsafe fn FindWindowExW<P2, P3>(
     hwndparent: Option<HWND>,
     hwndchildafter: Option<HWND>,
@@ -1201,9 +1216,19 @@ where
     }
 }
 #[inline]
+pub unsafe fn LoadResource(hmodule: Option<HMODULE>, hresinfo: HRSRC) -> HGLOBAL {
+    windows_core::link!("kernel32.dll" "system" fn LoadResource(hmodule : HMODULE, hresinfo : HRSRC) -> HGLOBAL);
+    unsafe { LoadResource(hmodule.unwrap_or(core::mem::zeroed()) as _, hresinfo) }
+}
+#[inline]
 pub unsafe fn LocalFree(hmem: HLOCAL) -> HLOCAL {
     windows_core::link!("kernel32.dll" "system" fn LocalFree(hmem : HLOCAL) -> HLOCAL);
     unsafe { LocalFree(hmem) }
+}
+#[inline]
+pub unsafe fn LockResource(hresdata: HGLOBAL) -> *mut core::ffi::c_void {
+    windows_core::link!("kernel32.dll" "system" fn LockResource(hresdata : HGLOBAL) -> *mut core::ffi::c_void);
+    unsafe { LockResource(hresdata) }
 }
 #[inline]
 pub unsafe fn MapVirtualKeyExW(ucode: u32, umaptype: u32, dwhkl: Option<HKL>) -> u32 {
@@ -1270,6 +1295,25 @@ pub unsafe fn MonitorFromWindow(hwnd: HWND, dwflags: u32) -> HMONITOR {
     unsafe { MonitorFromWindow(hwnd, dwflags) }
 }
 #[inline]
+pub unsafe fn MoveFileExW<P0, P1>(
+    lpexistingfilename: P0,
+    lpnewfilename: P1,
+    dwflags: u32,
+) -> windows_core::BOOL
+where
+    P0: windows_core::Param<windows_core::PCWSTR>,
+    P1: windows_core::Param<windows_core::PCWSTR>,
+{
+    windows_core::link!("kernel32.dll" "system" fn MoveFileExW(lpexistingfilename : windows_core::PCWSTR, lpnewfilename : windows_core::PCWSTR, dwflags : u32) -> windows_core::BOOL);
+    unsafe {
+        MoveFileExW(
+            lpexistingfilename.param().abi(),
+            lpnewfilename.param().abi(),
+            dwflags,
+        )
+    }
+}
+#[inline]
 pub unsafe fn MoveWindow(
     hwnd: HWND,
     x: i32,
@@ -1280,6 +1324,27 @@ pub unsafe fn MoveWindow(
 ) -> windows_core::BOOL {
     windows_core::link!("user32.dll" "system" fn MoveWindow(hwnd : HWND, x : i32, y : i32, nwidth : i32, nheight : i32, brepaint : windows_core::BOOL) -> windows_core::BOOL);
     unsafe { MoveWindow(hwnd, x, y, nwidth, nheight, brepaint.into()) }
+}
+#[inline]
+pub unsafe fn MultiByteToWideChar(
+    codepage: u32,
+    dwflags: u32,
+    lpmultibytestr: *const i8,
+    cbmultibyte: i32,
+    lpwidecharstr: Option<windows_core::PWSTR>,
+    cchwidechar: i32,
+) -> i32 {
+    windows_core::link!("kernel32.dll" "system" fn MultiByteToWideChar(codepage : u32, dwflags : u32, lpmultibytestr : *const i8, cbmultibyte : i32, lpwidecharstr : windows_core::PWSTR, cchwidechar : i32) -> i32);
+    unsafe {
+        MultiByteToWideChar(
+            codepage,
+            dwflags,
+            lpmultibytestr,
+            cbmultibyte,
+            lpwidecharstr.unwrap_or(core::mem::zeroed()) as _,
+            cchwidechar,
+        )
+    }
 }
 #[inline]
 pub unsafe fn OleGetClipboard() -> windows_core::Result<IDataObject> {
@@ -1405,6 +1470,15 @@ pub unsafe fn QueryDisplayConfig(
             currenttopologyid as _,
         )
     }
+}
+#[inline]
+pub unsafe fn QueryWorkingSet(
+    hprocess: HANDLE,
+    pv: *mut core::ffi::c_void,
+    cb: u32,
+) -> windows_core::BOOL {
+    windows_core::link!("kernel32.dll" "system" "K32QueryWorkingSet" fn QueryWorkingSet(hprocess : HANDLE, pv : *mut core::ffi::c_void, cb : u32) -> windows_core::BOOL);
+    unsafe { QueryWorkingSet(hprocess, pv as _, cb) }
 }
 #[inline]
 pub unsafe fn ReadDirectoryChangesW(
@@ -2233,6 +2307,11 @@ pub unsafe fn ShowWindow(hwnd: HWND, ncmdshow: i32) -> windows_core::BOOL {
     unsafe { ShowWindow(hwnd, ncmdshow) }
 }
 #[inline]
+pub unsafe fn SizeofResource(hmodule: Option<HMODULE>, hresinfo: HRSRC) -> u32 {
+    windows_core::link!("kernel32.dll" "system" fn SizeofResource(hmodule : HMODULE, hresinfo : HRSRC) -> u32);
+    unsafe { SizeofResource(hmodule.unwrap_or(core::mem::zeroed()) as _, hresinfo) }
+}
+#[inline]
 pub unsafe fn StackWalk64(
     machinetype: u32,
     hprocess: HANDLE,
@@ -2883,6 +2962,7 @@ impl Default for CONTEXT_0_0 {
 }
 #[cfg(target_arch = "aarch64")]
 pub type CONTEXT = ARM64_NT_CONTEXT;
+pub const CP_ACP: i32 = 0;
 pub const CREATE_ALWAYS: i32 = 2;
 pub const CREATE_NO_WINDOW: i32 = 134217728;
 pub const CS_DBLCLKS: i32 = 8;
@@ -3649,7 +3729,7 @@ pub const GENERIC_READ: u32 = 2147483648;
 pub const GENERIC_WRITE: i32 = 1073741824;
 pub type GETPROPERTYSTOREFLAGS = u32;
 pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: i32 = 4;
-pub const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: i32 = 2;
+pub const GET_MODULE_HANDLE_EX_FLAG_PIN: i32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GROUP_AFFINITY {
@@ -3733,6 +3813,9 @@ pub struct HPALETTE(pub *mut core::ffi::c_void);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct HRAWINPUT(pub *mut core::ffi::c_void);
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct HRSRC(pub *mut core::ffi::c_void);
 pub const HTBOTTOM: i32 = 15;
 pub const HTBOTTOMLEFT: i32 = 16;
 pub const HTBOTTOMRIGHT: i32 = 17;
@@ -15543,6 +15626,7 @@ pub const RI_MOUSE_LEFT_BUTTON_UP: i32 = 2;
 pub const RI_MOUSE_RIGHT_BUTTON_DOWN: i32 = 4;
 pub const RI_MOUSE_RIGHT_BUTTON_UP: i32 = 8;
 pub const RRF_RT_REG_DWORD: i32 = 16;
+pub const RT_VERSION: windows_core::PCWSTR = windows_core::PCWSTR(16 as _);
 pub const SC_MOVE: i32 = 61456;
 pub const SC_SIZE: i32 = 61440;
 pub const SDDL_REVISION_1: i32 = 1;
@@ -15810,6 +15894,7 @@ pub const SM_CXSMICON: i32 = 49;
 pub const SM_CYDOUBLECLK: i32 = 37;
 pub const SM_CYDRAG: i32 = 69;
 pub const SM_CYSCREEN: i32 = 1;
+pub const SM_SHUTTINGDOWN: i32 = 8192;
 pub const SM_SWAPBUTTON: i32 = 23;
 pub const SPI_GETCLIENTAREAANIMATION: i32 = 4162;
 pub const SPI_GETICONMETRICS: i32 = 45;
@@ -16132,6 +16217,7 @@ pub const WINEVENT_SKIPOWNPROCESS: i32 = 2;
 pub const WM_ACTIVATE: i32 = 6;
 pub const WM_ACTIVATEAPP: i32 = 28;
 pub const WM_APP: i32 = 32768;
+pub const WM_CANCELMODE: i32 = 31;
 pub const WM_CAPTURECHANGED: i32 = 533;
 pub const WM_CHAR: i32 = 258;
 pub const WM_CLOSE: i32 = 16;

@@ -5,7 +5,8 @@
 
 use crate::anchor::{self, AnchorCell};
 use crate::commands::{
-    Command, CommandQueue, TransferMode, WM_APP_FADE_DONE, WM_APP_SET_VISIBLE, WM_APP_TAB_SWAP_DONE,
+    Command, CommandQueue, TransferMode, WM_APP_FADE_DONE, WM_APP_SET_VISIBLE, WM_APP_TAB_RAIL,
+    WM_APP_TAB_SWAP_DONE,
 };
 use crate::icons::{IconCache, Lookup};
 use crate::layout::{
@@ -28,10 +29,12 @@ use pecofence_platform::tray::PopupMenu;
 use pecofence_platform::window::{
     self, MessageHandler, StandardCursor, Window, WindowBuilder, WindowClass, style,
 };
-use pecofence_platform::{HWND, RECT, desktop, dwm, monitors, msg};
+use pecofence_platform::{HWND, RECT, desktop, dwm, hotkey, monitors, msg};
 use pecofence_render::fence_chrome::{
     Backdrop, BackdropCrop, ContentDraw, FenceChrome, FenceStyle, GroupHeaderDraw, HeaderColumn,
-    ItemCell, RowCell, RowColumns, RowsDraw, ScrollbarDraw, TabDraw, TitleDeco, TitleState,
+    ItemCell, RAIL_BOTTOM, RAIL_COLLAPSED_BOTTOM, RAIL_ROW_H, RAIL_ROW_INSET, RAIL_ROW_RIGHT,
+    RAIL_TOP, RowCell, RowColumns, RowsDraw, ScrollbarDraw, StripClip, TabDraw, TitleDeco,
+    TitleState,
 };
 use pecofence_render::motion::{self, Curve, Fades, Motion, Prop, Tween};
 use pecofence_render::{
@@ -124,12 +127,18 @@ pub struct Behavior {
     pub title_on_hover: std::cell::Cell<bool>,
     /// Title (or tab strip) position in the title row (`titleAlign`).
     pub title_align: std::cell::Cell<pecofence_core::TitleAlign>,
+    /// Tabs in the title row or in a column on the left (`tabBar`).
+    pub tab_bar: std::cell::Cell<pecofence_core::TabBar>,
+    /// Item names in the backdrop's ink or always white / black (`labelColor`).
+    pub label_color: std::cell::Cell<pecofence_core::LabelColor>,
     /// Where adaptive text takes its colour from (`textColor`).
     pub text_color: std::cell::Cell<pecofence_core::TextColor>,
     /// Scrollbar drawn only while hovered / shortly after scrolling.
     pub hide_inactive_scrollbar: std::cell::Cell<bool>,
     /// Resting the pointer on another tab switches to it (`rollUp.switchTabOnHover`).
     pub switch_tab_on_hover: std::cell::Cell<bool>,
+    /// No rolled item count and no roll chevron (`rollUp.hideCountAndChevron`).
+    pub hide_count_and_chevron: std::cell::Cell<bool>,
     /// `SPI_GETWHEELSCROLLLINES`: rows per wheel notch; `u32::MAX` (`WHEEL_PAGESCROLL`) = one
     /// viewport, 0 = the wheel does not scroll. Refreshed on WM_SETTINGCHANGE.
     pub wheel_lines: std::cell::Cell<u32>,
@@ -363,6 +372,8 @@ pub struct TabView {
     pub color: Option<[u8; 3]>,
     pub title_size: u8,
     pub title_color: Option<ColorF>,
+    /// A folder portal whose title icon is shown: the tab pill carries the folder glyph.
+    pub folder_icon: bool,
 }
 
 type ViewCell = Rc<RefCell<Option<FenceViewState>>>;

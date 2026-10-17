@@ -20,7 +20,7 @@ const FACT_MAX: usize = 200;
 #[derive(Default)]
 pub(super) struct FeedbackState {
     /// The page to show once the freshly opened settings page is ready (`Some(crash)`).
-    focus: Option<bool>,
+    pub(super) focus: Option<bool>,
     /// The previous run ended in a panic or an unhandled exception (its shareable log says so).
     previous_run_crashed: bool,
     /// The crash balloon is up; clicking it opens the feedback form.
@@ -132,16 +132,17 @@ impl App {
 
     /// Opens the settings window at the 「反馈」 form (on 「关于」); `crash` says it reports the last crash.
     pub(super) fn open_feedback(&mut self, crash: bool) {
-        let already_open = self.settings.is_some();
         self.open_settings();
-        if self.settings.is_none() {
+        let Some(host) = &self.settings else {
             return;
-        }
-        if already_open {
+        };
+        if host.ready {
             self.post_show_feedback(crash);
         } else {
-            // The page is still loading; `ready` delivers the state and then this.
+            // The page is still loading; `ready` delivers the state and then the latest
+            // request: this form, or a fence's options.
             self.feedback.focus = Some(crash);
+            self.settings_focus_fence = None;
         }
     }
 
@@ -179,19 +180,35 @@ impl App {
             })
             .collect();
         let settings = &self.state.config.settings;
-        let mem_mb = pecofence_platform::memstats::MemoryStats::current()
-            .map(|m| m.private_working_set as f64 / (1024.0 * 1024.0))
-            .unwrap_or(0.0);
+        // Task Manager's number first, then where else memory sits: private commit counts
+        // pages Windows trimmed, GPU memory the surfaces and textures.
+        const MB: f64 = 1024.0 * 1024.0;
+        let mem = pecofence_platform::memstats::MemoryStats::current().unwrap_or_default();
+        let gpu = match self.ctx.stack.gpu_memory() {
+            Some((local, shared)) => format!(
+                "GPU {:.1} MB dedicated, {:.1} MB shared",
+                local as f64 / MB,
+                shared as f64 / MB,
+            ),
+            None => "GPU unknown".to_string(),
+        };
+        let memory = format!(
+            "{:.1} MB (commit {:.1} MB, {gpu})",
+            mem.private_working_set as f64 / MB,
+            mem.private_commit as f64 / MB,
+        );
         // The settings that change how the fences sit on the desktop.
         let behavior = format!(
-            "showDesktop {:?}, zorder {:?}, hideIcons {}, quickHide {}, peek {} (dim {}, {:?}), autostart {}, iconSize {}",
+            "showDesktop {:?}, zorder {:?}, hideIcons {}, quickHide {}, peek {} (dim {}, {}, active {}), autostart {}, iconSize {}",
             settings.show_desktop,
             settings.zorder,
             on_off(settings.hide_real_icons),
             on_off(settings.quick_hide.enabled),
             on_off(settings.peek.enabled),
             on_off(settings.peek.dim),
-            settings.peek.hotkey,
+            settings.peek.chosen_hotkey(),
+            self.peek_hotkey
+                .map_or_else(|| "none".to_string(), |h| h.to_string()),
             on_off(settings.autostart),
             settings.icon_size,
         );
@@ -245,7 +262,8 @@ impl App {
                 self.state.fences().len(),
                 self.state.workspace_item_count()
             ),
-            "memory": format!("{mem_mb:.1} MB"),
+            "memory": memory,
+            "gpu": fact(self.ctx.stack.adapter().unwrap_or_else(|| "unknown".to_string())),
         });
         let mut log = String::new();
         if self.feedback.previous_run_crashed

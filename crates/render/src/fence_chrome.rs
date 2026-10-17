@@ -4,15 +4,17 @@
 
 use crate::backdrop::Image;
 use crate::bitmaps::BitmapCache;
+use crate::gpu_bindings as b;
 use crate::panel::Clip;
 use crate::theme::{Theme, ThemeMode, font_small, font_text, lerp, with_alpha};
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::rc::Rc;
 use windows_canvas::{
-    Brush, ColorF, DrawingSession, FontWeight, GradientStop, Matrix3x2, ParagraphAlignment, Rect,
-    RoundedRect, TextAlignment, TextFormat, TextLayout, Vector2, WordWrapping,
+    Brush, ColorF, DrawingSession, FontWeight, GradientStop, Matrix3x2, Paint, ParagraphAlignment,
+    Rect, RoundedRect, TextAlignment, TextFormat, TextLayout, Vector2, WordWrapping,
 };
-use windows_core::Result;
+use windows_core::{Interface, Result};
 
 /// Icon-label font: the system icon-title font (`SPI_GETICONTITLELOGFONT` scaled by the
 /// Settings › Accessibility › Text size factor, see `sysparams::icon_title_font`) with its
@@ -45,6 +47,9 @@ pub struct FenceChrome {
     sort_glyph_format: TextFormat,
     /// Same face, size and weight as standalone titles, centred inside their controls.
     tab_formats: [TextFormat; 4],
+    /// The left tab column's resting captions: regular weight, leading (the shown tab uses
+    /// the semibold title format).
+    tab_list_formats: [TextFormat; 4],
     /// Empty-state text: Body 14, top-aligned (Explorer "This folder is empty.").
     empty_format: TextFormat,
     /// 14 px Fluent glyph beside the title (portal folder icon).
@@ -75,6 +80,9 @@ pub struct GroupHeaderDraw<'a> {
 pub struct BackdropCrop<'a> {
     pub image: &'a Image,
     pub key: &'a str,
+    /// DIP size the crop covers, from the window's top left (wider or taller than the surface
+    /// while the window shrinks or grows).
+    pub width: f32,
     pub height: f32,
 }
 
@@ -241,6 +249,14 @@ pub struct RowsDraw<'a> {
     pub insert_caret_alpha: f32,
     /// 0 = accent selection (active window), 1 = neutral grey (another window is active).
     pub selection_inactive: f32,
+    /// Window position (DIPs) of the surface's top-left corner: the left tab column's width
+    /// and the title row's height (0 beside a left tab column). The glass behind the text is
+    /// sampled in window coordinates.
+    pub origin_x: f32,
+    pub origin_y: f32,
+    /// The rows end here (surface DIPs): 「调整大小时按整行整列对齐」 leaves the height under
+    /// the whole rows empty. `f32::INFINITY` = the surface's bottom.
+    pub rows_bottom: f32,
 }
 
 /// Pixel snapping for hairlines. The panel applies a uniform DIP→px scale, so a 1 DIP stroke
@@ -307,7 +323,26 @@ pub struct FenceStyle {
     pub title_size: u8,
     /// Title position in the row (the global 标题对齐 setting).
     pub title_align: pecofence_core::TitleAlign,
+    /// Width in DIPs of the left tab column (标签栏位置 → 左侧, two or more tabs). The column
+    /// is the fence's title bar, so there is no title row; 0 = the tabs, if any, run along the
+    /// title row.
+    pub tab_rail: f32,
+    /// No item count on a rolled title and no roll chevron (the global
+    /// 「隐藏标题栏右侧的项目数和折叠箭头」 setting).
+    pub hide_count_and_chevron: bool,
 }
+
+/// Left tab column metrics (DIPs): the free strip above the first tab (a handle to drag the
+/// fence by), each tab row's height, its inset from the window's left edge and from the
+/// divider, and the room under the last tab that holds the collapse chevron. Collapsed to the
+/// column the fence has no chevron (a tab click expands it): the last tab keeps the top strip's
+/// room under it.
+pub const RAIL_TOP: f32 = 8.0;
+pub const RAIL_ROW_H: f32 = 32.0;
+pub const RAIL_ROW_INSET: f32 = 4.0;
+pub const RAIL_ROW_RIGHT: f32 = 6.0;
+pub const RAIL_BOTTOM: f32 = 44.0;
+pub const RAIL_COLLAPSED_BOTTOM: f32 = RAIL_TOP;
 
 /// Title-row decorations of a folder portal: a folder glyph before the title and, once the
 /// portal has navigated into a subfolder, an "up" button at the far left.
@@ -342,6 +377,77 @@ pub struct TitleState {
     /// How far a fully transparent fence (外观 → 全透明) has cleared its plate: 0 = drawn,
     /// 1 = no glass, tint or rim at all (the resting look away from the pointer).
     pub plate_clear: f32,
+    /// A tab strip too wide for its room scrolls: where its pills are cut. None = it fits.
+    pub strip_clip: Option<StripClip>,
+}
+
+/// The visible span of a scrolled tab strip (DIPs). An end with more pills behind it fades out
+/// over `STRIP_FADE_W`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StripClip {
+    pub left: f32,
+    /// The right end beside the roll-up chevron.
+    pub right: f32,
+    /// The right end while the chevron is hidden (an expanded fence, pointer away from the
+    /// title): the strip runs on under the chevron's place.
+    pub rest_right: f32,
+    /// Where the last pill ends: the right end fades while pills lie past it.
+    pub content_right: f32,
+    pub fade_left: bool,
+}
+
+/// Width (DIPs) of the fade at an end of a scrolled tab strip with more pills behind it.
+pub const STRIP_FADE_W: f32 = 12.0;
+
+/// Starts drawing a scrolled tab strip into a layer cut to `clip` (`title_h` tall) whose
+/// opacity falls to 0 over `STRIP_FADE_W` at the ends with pills behind them. The right end
+/// moves from `rest_right` to `right` as the chevron fades in (`chevron` 0..=1). The returned
+/// brush must live until `pop_strip_fade` ends the layer.
+fn push_strip_fade(
+    session: &DrawingSession<'_>,
+    clip: StripClip,
+    title_h: f32,
+    chevron: f32,
+) -> Result<b::ID2D1Brush> {
+    let right = clip.rest_right + (clip.right - clip.rest_right) * chevron.clamp(0.0, 1.0);
+    let fade_right = clip.content_right > right + 0.5;
+    let fade = (STRIP_FADE_W / (right - clip.left).max(1.0)).min(0.5);
+    let opaque = ColorF::new(0.0, 0.0, 0.0, 1.0);
+    let end = |hidden: bool| if hidden { ColorF::TRANSPARENT } else { opaque };
+    let gradient = session.create_linear_gradient(
+        Vector2::new(clip.left, 0.0),
+        Vector2::new(right, 0.0),
+        &[
+            GradientStop::new(0.0, end(clip.fade_left)),
+            GradientStop::new(fade, opaque),
+            GradientStop::new(1.0 - fade, opaque),
+            GradientStop::new(1.0, end(fade_right)),
+        ],
+    )?;
+    let brush: b::ID2D1Brush = gradient.as_raw_brush().cast()?;
+    let context: b::ID2D1DeviceContext = session.raw().cast()?;
+    let params = b::D2D1_LAYER_PARAMETERS1 {
+        contentBounds: b::D2D_RECT_F {
+            left: clip.left,
+            top: 0.0,
+            right,
+            bottom: title_h,
+        },
+        maskTransform: windows_numerics::Matrix3x2::identity(),
+        opacity: 1.0,
+        opacityBrush: ManuallyDrop::new(Some(brush.clone())),
+        ..Default::default()
+    };
+    unsafe { context.PushLayer(&params, None::<&b::ID2D1Layer>) };
+    drop(ManuallyDrop::into_inner(params.opacityBrush));
+    Ok(brush)
+}
+
+/// Ends the layer `push_strip_fade` started.
+fn pop_strip_fade(session: &DrawingSession<'_>, _brush: b::ID2D1Brush) {
+    if let Ok(context) = session.raw().cast::<b::ID2D1DeviceContext>() {
+        unsafe { context.PopLayer() };
+    }
 }
 
 impl TitleDeco {
@@ -366,6 +472,31 @@ impl TitleDeco {
             (title_h - Self::CHEVRON_W) / 2.0,
             Self::CHEVRON_W,
             Self::CHEVRON_W,
+        )
+    }
+
+    /// The collapse chevron of a left tab column `rail_w` wide in a window `height` tall,
+    /// centred in the room under the tabs (`RAIL_BOTTOM`), never above the last tab's end
+    /// `rows_end`: while the fence collapses or expands the moving bottom edge hides it instead
+    /// of it sliding over the tab. The app hit-tests the same box.
+    pub fn rail_chevron_box(rail_w: f32, height: f32, rows_end: f32) -> Rect {
+        let gap = (RAIL_BOTTOM - Self::CHEVRON_W) * 0.5;
+        Rect::from_xywh(
+            ((rail_w - Self::CHEVRON_W) * 0.5).max(0.0),
+            (height - Self::CHEVRON_W - gap).max(rows_end + gap),
+            Self::CHEVRON_W,
+            Self::CHEVRON_W,
+        )
+    }
+
+    /// The portal up button at the end of the shown tab's `row` in a left tab column; the app
+    /// hit-tests the same box.
+    pub fn rail_up_box(row: Rect) -> Rect {
+        Rect::from_xywh(
+            row.right - 26.0,
+            row.top + (row.height() - 24.0) * 0.5,
+            24.0,
+            24.0,
         )
     }
 
@@ -411,6 +542,8 @@ pub struct TabDraw<'a> {
     pub title: &'a str,
     pub title_size: u8,
     pub title_color: Option<ColorF>,
+    /// A folder portal tab: its folder glyph is drawn before the caption (`TAB_ICON_W` wider).
+    pub folder_icon: bool,
     pub active: bool,
     /// PointerOver pill alpha 0..=1.
     pub hover: f32,
@@ -452,6 +585,20 @@ pub fn header_control_radius(theme: &Theme, rect: Rect) -> f32 {
     }
 }
 
+/// Room a folder glyph takes before a tab caption (DIPs).
+const TAB_ICON_W: f32 = 20.0;
+
+/// Width the folder glyph adds before a tab caption: `TAB_ICON_W` for a folder tab, else 0.
+pub fn tab_icon_w(folder_icon: bool) -> f32 {
+    if folder_icon { TAB_ICON_W } else { 0.0 }
+}
+
+/// Where captions start in a left tab column row: after the colour dot when any tab has a
+/// colour, and after the folder glyph when any tab has one, so the names stay aligned.
+fn rail_text_left(colored: bool, folders: bool) -> f32 {
+    (if colored { 24.0 } else { 10.0 }) + tab_icon_w(folders)
+}
+
 pub fn tab_text_padding(theme: &Theme) -> f32 {
     if theme.liquid_glass { 24.0 } else { 16.0 }
 }
@@ -466,13 +613,12 @@ pub fn tab_text_inset(theme: &Theme, w: f32, text_w: f32) -> f32 {
     (w - text_w).clamp(TAB_TEXT_MIN_PADDING, tab_text_padding(theme))
 }
 
-/// Counts are secondary: a short collapsed fence must retain space for its title/tabs.
+/// Counts are secondary: a short collapsed fence must retain space for its title/tabs. A tab
+/// strip that does not fit scrolls, so room for two of its narrowest tabs is enough.
 pub fn header_count_width(width: f32, tabs: usize, title_x: f32) -> f32 {
     let (left, captions) = if tabs > 1 {
-        (
-            8.0,
-            tabs as f32 * 48.0 + tabs.saturating_sub(1) as f32 * 4.0,
-        )
+        let shown = tabs.min(2) as f32;
+        (8.0, shown * 48.0 + (shown - 1.0) * 4.0)
     } else {
         (title_x, 64.0)
     };
@@ -584,10 +730,11 @@ fn draw_plate(
 ) -> Result<()> {
     let px = Px::new(scale);
     let plate_top = outer.top;
-    // The crop is anchored at the window top and may cover more than the surface (height
+    // The crop is anchored at the window's top left and may cover more than the surface (size
     // animation): the surface clips it, and the compositor clip cuts it at a folded top.
-    let crop_rect =
-        |crop: &BackdropCrop<'_>| Rect::from_xywh(0.0, 0.0, width, crop.height.max(height));
+    let crop_rect = |crop: &BackdropCrop<'_>| {
+        Rect::from_xywh(0.0, 0.0, crop.width.max(width), crop.height.max(height))
+    };
     match *backdrop {
         Backdrop::GpuGlass {
             material,
@@ -695,7 +842,22 @@ fn draw_plate(
     if let Some(mut tint) = style.tint {
         // Per-fence colour: a translucent wash so the glass still reads as glass.
         tint.a = 0.22 * plate_a;
-        if style.tint_title_only {
+        if style.tint_title_only && style.tab_rail > 0.0 {
+            // A left tab column is the title bar: the plate's rounded left corners, a straight
+            // right edge where the icons start.
+            let edge = (style.tab_rail / outer.width().max(1.0)).min(1.0);
+            let soft = (px.hair() / outer.width().max(1.0)).min(1.0 - edge);
+            let wash = session.create_linear_gradient(
+                Vector2::new(outer.left, 0.0),
+                Vector2::new(outer.right, 0.0),
+                &[
+                    GradientStop::new(0.0, tint),
+                    GradientStop::new(edge, tint),
+                    GradientStop::new(edge + soft, ColorF::TRANSPARENT),
+                ],
+            )?;
+            session.fill_rounded_rect(&RoundedRect::uniform(outer, radius), &wash);
+        } else if style.tint_title_only {
             // Only the title row (what of it the fold leaves): the plate's rounded top
             // corners, a straight bottom edge where the icons start.
             let band = theme.title_height.min(height) - plate_top;
@@ -875,18 +1037,19 @@ fn draw_caption(
         session.draw_text(text, format, rect, brush);
         return;
     }
-    if let Some(halo) = halo {
-        for (dx, dy) in [(-0.75, 0.0), (0.75, 0.0), (0.0, -0.75), (0.0, 0.75)] {
-            let r = Rect {
-                left: rect.left + dx,
-                top: rect.top + dy,
-                right: rect.right + dx,
-                bottom: rect.bottom + dy,
-            };
-            session.draw_text(text, format, &r, halo);
-        }
+    let Some(halo) = halo else {
+        session.draw_text(text, format, rect, brush);
+        return;
+    };
+    // Shaped once for the five passes: `draw_text` lays the text out anew on every call.
+    let Ok(layout) = TextLayout::new(text, format, rect.width(), rect.height()) else {
+        session.draw_text(text, format, rect, brush);
+        return;
+    };
+    for (dx, dy) in [(-0.75, 0.0), (0.75, 0.0), (0.0, -0.75), (0.0, 0.75)] {
+        session.draw_text_layout(Vector2::new(rect.left + dx, rect.top + dy), &layout, halo);
     }
-    session.draw_text(text, format, rect, brush);
+    session.draw_text_layout(Vector2::new(rect.left, rect.top), &layout, brush);
 }
 
 fn draw_legible_text(
@@ -943,6 +1106,24 @@ pub fn chevron_angle(roll_t: f32) -> f32 {
     180.0 * roll_t.clamp(0.0, 1.0)
 }
 
+/// How selected a row of a left tab column looks (0..=1): the shown tab while the fence is
+/// `expanded` (1 - roll progress; a collapsed column shows its tabs alike), a dragged tab always.
+pub fn rail_selected(active: bool, dragging: bool, expanded: f32) -> f32 {
+    if dragging {
+        1.0
+    } else if active {
+        expanded.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+/// Opacity of a left tab column's chevron: the column's hover, faded out by the roll progress
+/// (0 expanded ..= 1 collapsed to the column, which has no chevron).
+pub fn rail_chevron_alpha(hover: f32, roll_t: f32) -> f32 {
+    hover.clamp(0.0, 1.0) * (1.0 - roll_t.clamp(0.0, 1.0))
+}
+
 /// `BitmapCache` key of the acrylic noise tile (one upload per device).
 /// How much of the fence plate is the (blurred, tinted) wallpaper crop and how much is the real
 /// desktop behind the window showing through. 1.0 = the old fully opaque plate; the default lets
@@ -982,6 +1163,9 @@ pub struct ContentDraw<'a> {
     pub insert_caret_alpha: f32,
     /// 0 = accent selection (active window), 1 = neutral grey (another window is active).
     pub selection_inactive: f32,
+    /// The items end here (surface DIPs): 「调整大小时按整行整列对齐」 leaves the height under
+    /// the whole rows empty. `f32::INFINITY` = the surface's bottom.
+    pub items_bottom: f32,
 }
 
 /// The brushes an item-state pass needs, created once per content draw. The per-item alphas
@@ -1001,6 +1185,8 @@ struct StateBrushes {
     /// fading in cost no brush allocations per frame.
     scratch_a: Brush,
     scratch_b: Brush,
+    /// The label halo over wallpaper (Liquid Glass, text_halo), recoloured per cell.
+    halo: Brush,
 }
 
 impl StateBrushes {
@@ -1013,7 +1199,14 @@ impl StateBrushes {
             focus_inner: session.create_solid_brush(theme.focus_inner)?,
             scratch_a: session.create_solid_brush(theme.text_primary)?,
             scratch_b: session.create_solid_brush(theme.text_secondary)?,
+            halo: session.create_solid_brush(halo_color(theme.text_primary, 1.0))?,
         })
+    }
+
+    /// `halo` recoloured to `c`.
+    fn halo(&self, c: ColorF) -> &Brush {
+        self.halo.set_color(c);
+        &self.halo
     }
 
     /// `scratch_a` recoloured to `c`.
@@ -1385,6 +1578,20 @@ impl FenceChrome {
             tab_format(font_text(), 16.0)?,
             tab_format(font_text(), 18.0)?,
         ];
+        let list_format = |face, size| -> Result<TextFormat> {
+            Ok(
+                TextFormat::with_locale(face, size, FontWeight::NORMAL, locale)?
+                    .with_alignment(TextAlignment::Leading)
+                    .with_paragraph_alignment(ParagraphAlignment::Center)
+                    .with_word_wrapping(WordWrapping::NoWrap),
+            )
+        };
+        let tab_list_formats = [
+            list_format(font_small(), 12.0)?,
+            list_format(font_text(), 14.0)?,
+            list_format(font_text(), 16.0)?,
+            list_format(font_text(), 18.0)?,
+        ];
         let empty_format = TextFormat::with_locale(font_text(), 14.0, FontWeight::NORMAL, locale)?
             .with_alignment(TextAlignment::Center)
             .with_paragraph_alignment(ParagraphAlignment::Top)
@@ -1426,6 +1633,7 @@ impl FenceChrome {
             row_format_right,
             sort_glyph_format,
             tab_formats,
+            tab_list_formats,
             empty_format,
             title_glyph_format,
             title_format_small,
@@ -1525,9 +1733,50 @@ impl FenceChrome {
     }
 
     /// Does a tab caption fit its pill of width `w` without ellipsis (tooltip decision)?
-    pub fn tab_title_fits(&self, title: &str, w: f32, size: u8, theme: &Theme) -> bool {
-        let text_w = crate::text::measure_width(title, self.tab_format(size));
-        text_w <= (w - tab_text_inset(theme, w, text_w)).max(0.0)
+    pub fn tab_title_fits(
+        &self,
+        title: &str,
+        w: f32,
+        size: u8,
+        folder_icon: bool,
+        theme: &Theme,
+    ) -> bool {
+        let content_w =
+            crate::text::measure_width(title, self.tab_format(size)) + tab_icon_w(folder_icon);
+        content_w <= (w - tab_text_inset(theme, w, content_w)).max(0.0)
+    }
+
+    /// Width a caption gets in a row of a `rail_w` DIP left tab column: after the colour dot's
+    /// room when any tab has a colour and the folder glyph's when any tab has one, before the
+    /// badge and the portal up button.
+    pub fn rail_title_room(
+        &self,
+        rail_w: f32,
+        colored: bool,
+        folders: bool,
+        badge: Option<&str>,
+        up: bool,
+    ) -> f32 {
+        let row_w = (rail_w - RAIL_ROW_INSET - RAIL_ROW_RIGHT).max(0.0);
+        let text_left = rail_text_left(colored, folders);
+        let badge_w = badge.map_or(0.0, |b| self.tab_badge_width(b) - TAB_BADGE_GAP);
+        let badge_gap = if badge_w > 0.0 { 6.0 } else { 0.0 };
+        let up_w = if up { 26.0 } else { 0.0 };
+        (row_w - text_left - 8.0 - badge_w - badge_gap - up_w).max(0.0)
+    }
+
+    /// Caption format of a left tab column row: semibold for the shown tab.
+    fn rail_title_format(&self, size: u8, active: bool) -> &TextFormat {
+        if active {
+            self.title_format(size)
+        } else {
+            &self.tab_list_formats[usize::from(size.min(3))]
+        }
+    }
+
+    /// `title` shows whole in `room` DIPs of a left tab column row.
+    pub fn rail_title_fits(&self, title: &str, room: f32, size: u8, active: bool) -> bool {
+        crate::text::measure_width(title, self.rail_title_format(size, active)) <= room
     }
 
     /// Draws the chrome into a `width` x `height` DIP area whose origin is (0, 0). `scale` is
@@ -1583,6 +1832,8 @@ impl FenceChrome {
         };
         let title_h = theme.title_height.min(height);
         let pill_a = state.hover * title_a;
+        // Two or more tabs on the left: the column is the title bar, there is no title row.
+        let column = style.tab_rail > 0.0 && tabs.len() > 1;
 
         if plate_a > 0.0 {
             draw_plate(
@@ -1624,7 +1875,17 @@ impl FenceChrome {
             // fading in over 83 ms and out over 167 ms.
             let a = state.merge_hint.min(1.0);
             let wash = session.create_solid_brush(with_alpha(theme.drop_highlight, a))?;
-            let row = Rect::from_xywh(4.0, 4.0, (width - 8.0).max(0.0), (title_h - 8.0).max(0.0));
+            // Over the left tab column when that is the title bar.
+            let row = if column {
+                Rect::from_xywh(
+                    4.0,
+                    4.0,
+                    (style.tab_rail - 8.0).max(0.0),
+                    (height - 8.0).max(0.0),
+                )
+            } else {
+                Rect::from_xywh(4.0, 4.0, (width - 8.0).max(0.0), (title_h - 8.0).max(0.0))
+            };
             let radius = header_control_radius(theme, row);
             if theme.liquid_glass {
                 draw_header_glass(session, &backdrop, theme, scale, 2, row, 0.5, a)?;
@@ -1642,6 +1903,43 @@ impl FenceChrome {
             session.fill_rect(
                 &Rect::from_xywh(width * 0.5 - 2.0, height * 0.5 + 6.0, 4.0, 4.0),
                 &marker,
+            );
+        }
+        if column {
+            let halo = if theme.text_halo {
+                Some(session.create_solid_brush(ColorF::TRANSPARENT)?)
+            } else {
+                None
+            };
+            self.draw_tab_list(
+                session,
+                &backdrop,
+                theme,
+                scale,
+                opacity,
+                style.tint,
+                tabs,
+                pill,
+                halo.as_ref(),
+                style.tab_rail,
+                height,
+                1.0 - roll_t.clamp(0.0, 1.0),
+                deco,
+                state,
+            )?;
+            // ChevronLeft (E76B) collapses the fence to its column, revealed with the column's
+            // hover like the title row's chevron. A collapsed column has none (a tab click
+            // expands it): the chevron turns as it fades out with the collapse, and back in
+            // as the fence expands.
+            if style.hide_count_and_chevron {
+                return Ok(());
+            }
+            let chevron_a = rail_chevron_alpha(state.hover, roll_t);
+            let rows_end = tabs.iter().map(|t| t.x + t.w).fold(0.0, f32::max);
+            let box_r = TitleDeco::rail_chevron_box(style.tab_rail, height, rows_end);
+            return self.draw_chevron(
+                session, &backdrop, theme, scale, opacity, style.tint, box_r, "\u{E76B}",
+                chevron_a, state, roll_t,
             );
         }
         if title_a <= 0.0 {
@@ -1682,7 +1980,8 @@ impl FenceChrome {
         let tertiary = session.create_solid_brush(with_alpha(foreground.text_tertiary, title_a))?;
         let title_format = self.title_format(style.title_size);
         // Rolled plate: the item count sits before the chevron so a rolled fence still tells
-        // you what is inside (it fades out as the fence expands).
+        // you what is inside (it fades out as the fence expands), unless the user hid it.
+        let caption = caption.filter(|_| !style.hide_count_and_chevron);
         let count_a = state.count.clamp(0.0, 1.0) * title_a;
         let count_w = if caption.is_some() && (rolled_up || count_a > 0.0) {
             header_count_width(width, tabs.len(), deco.title_x())
@@ -1697,7 +1996,20 @@ impl FenceChrome {
         } else {
             0.0
         };
+        // The roll-up chevron: shown while rolled or rolling, otherwise on hover, never when the
+        // user hid it.
+        let chevron_shown = if style.hide_count_and_chevron {
+            0.0
+        } else if rolled_up || roll_t > 0.0 {
+            1.0
+        } else {
+            state.hover.clamp(0.0, 1.0)
+        };
         if tabs.len() > 1 {
+            let strip_fade = match state.strip_clip {
+                Some(clip) => Some(push_strip_fade(session, clip, title_h, chevron_shown)?),
+                None => None,
+            };
             let inset = if theme.liquid_glass { 4.0 } else { 6.0 };
             let pill_h = (title_h - inset * 2.0).max(0.0);
             let tab_rect = |x, w| Rect::from_xywh(x, inset, w, pill_h);
@@ -1796,25 +2108,29 @@ impl FenceChrome {
                 }
                 let fmt = self.tab_format(tab.title_size);
                 let badge_w = tab.badge.map_or(0.0, |b| self.tab_badge_width(b));
-                let padding = tab_text_inset(
-                    theme,
-                    tab.w - badge_w,
-                    crate::text::measure_width(tab.title, fmt),
-                );
-                let caption_w = (tab.w - badge_w - padding).max(0.0);
+                let icon_w = tab_icon_w(tab.folder_icon);
+                let title_w = crate::text::measure_width(tab.title, fmt);
+                let padding = tab_text_inset(theme, tab.w - badge_w, title_w + icon_w);
+                let caption_w = (tab.w - badge_w - icon_w - padding).max(0.0);
                 let fitted = crate::text::fit_width(tab.title, fmt, caption_w);
-                // With a badge, caption and badge are centred in the pill as one group.
-                let shown_w = if tab.badge.is_some() {
-                    crate::text::measure_width(&fitted, fmt).min(caption_w)
+                // With a folder glyph or a badge, they and the caption are centred in the pill
+                // as one group. An unelided caption keeps the width measured above.
+                let shown_w = if tab.badge.is_some() || tab.folder_icon {
+                    if fitted == tab.title {
+                        title_w
+                    } else {
+                        crate::text::measure_width(&fitted, fmt)
+                    }
+                    .min(caption_w)
                 } else {
                     caption_w
                 };
-                let caption_x = tab.x + (tab.w - shown_w - badge_w) * 0.5;
+                let caption_x = tab.x + icon_w + (tab.w - icon_w - shown_w - badge_w) * 0.5;
                 // A persistent marker identifies the selected tab even on uniform wallpaper. It
-                // stays under the caption when a badge widens the pill.
+                // stays under the glyph and caption when a badge widens the pill.
                 let (marker_x, marker_w) = if tab.badge.is_some() {
                     let w = tab.w - badge_w;
-                    (caption_x + (shown_w - w) * 0.5, w)
+                    (caption_x - icon_w + (icon_w + shown_w - w) * 0.5, w)
                 } else {
                     (tab.x, tab.w)
                 };
@@ -1840,6 +2156,14 @@ impl FenceChrome {
                 let brush = session.create_solid_brush(with_alpha(color, ta))?;
                 if let Some(halo) = &halo {
                     halo.set_color(halo_color(color, ta));
+                }
+                if tab.folder_icon {
+                    session.draw_text(
+                        "\u{E8B7}",
+                        &self.title_glyph_format,
+                        &Rect::from_xywh(caption_x - icon_w - 2.0, 0.0, icon_w, title_h),
+                        &brush,
+                    );
                 }
                 draw_caption(
                     session,
@@ -1869,6 +2193,9 @@ impl FenceChrome {
                     let text = session.create_solid_brush(with_alpha(on_accent, ta))?;
                     session.draw_text(badge, &self.badge_format, &r, &text);
                 }
+            }
+            if let Some(brush) = strip_fade {
+                pop_strip_fade(session, brush);
             }
         } else {
             let mut x = 16.0;
@@ -1991,62 +2318,319 @@ impl FenceChrome {
         // the chevron stays fully shown until the height has settled, so an expand started
         // with the pointer off the title row (context menu, keyboard) does not pop it to the
         // hover alpha on its first frame.
-        let chevron_a = if rolled_up || roll_t > 0.0 {
-            1.0
+        if style.hide_count_and_chevron {
+            return Ok(());
+        }
+        let chevron_a = chevron_shown * title_a;
+        let box_r = TitleDeco::chevron_box(width, title_h);
+        self.draw_chevron(
+            session, &backdrop, theme, scale, opacity, style.tint, box_r, "\u{E70E}", chevron_a,
+            state, roll_t,
+        )
+    }
+
+    /// The roll chevron (`glyph`, turned 180° by the roll progress `roll_t`) in its 32×32
+    /// button box at opacity `chevron_a`: per-control hover pill and pressed fill like a Fluent
+    /// transparent icon button, tertiary at rest and secondary as its row is hovered.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_chevron(
+        &self,
+        session: &DrawingSession<'_>,
+        backdrop: &Backdrop<'_>,
+        theme: &Theme,
+        scale: f32,
+        opacity: f32,
+        tint: Option<ColorF>,
+        box_r: Rect,
+        glyph: &str,
+        chevron_a: f32,
+        state: TitleState,
+        roll_t: f32,
+    ) -> Result<()> {
+        if chevron_a <= 0.0 {
+            return Ok(());
+        }
+        let foreground = header_foreground(backdrop, theme, 7, box_r, scale, opacity, tint);
+        if theme.liquid_glass && (state.chevron_pressed || state.chevron_hover > 0.0) {
+            draw_header_glass(
+                session,
+                backdrop,
+                theme,
+                scale,
+                4,
+                box_r,
+                if state.chevron_pressed { 0.85 } else { 0.45 },
+                chevron_a
+                    * if state.chevron_pressed {
+                        1.0
+                    } else {
+                        state.chevron_hover
+                    },
+            )?;
+        } else if state.chevron_pressed {
+            let pill = session.create_solid_brush(with_alpha(theme.subtle_pressed, chevron_a))?;
+            session.fill_rounded_rect(&RoundedRect::uniform(box_r, 4.0), &pill);
+        } else if state.chevron_hover > 0.0 {
+            let pill = session.create_solid_brush(with_alpha(
+                theme.subtle_hover,
+                state.chevron_hover * chevron_a,
+            ))?;
+            session.fill_rounded_rect(&RoundedRect::uniform(box_r, 4.0), &pill);
+        }
+        let color = if state.chevron_pressed {
+            foreground.text_tertiary
         } else {
-            state.hover.clamp(0.0, 1.0)
-        } * title_a;
-        if chevron_a > 0.0 {
-            let box_r = TitleDeco::chevron_box(width, title_h);
-            let foreground =
-                header_foreground(&backdrop, theme, 7, box_r, scale, opacity, style.tint);
-            if theme.liquid_glass && (state.chevron_pressed || state.chevron_hover > 0.0) {
-                draw_header_glass(
-                    session,
-                    &backdrop,
-                    theme,
-                    scale,
-                    4,
-                    box_r,
-                    if state.chevron_pressed { 0.85 } else { 0.45 },
-                    chevron_a
-                        * if state.chevron_pressed {
-                            1.0
-                        } else {
-                            state.chevron_hover
-                        },
-                )?;
-            } else if state.chevron_pressed {
-                let pill =
-                    session.create_solid_brush(with_alpha(theme.subtle_pressed, chevron_a))?;
-                session.fill_rounded_rect(&RoundedRect::uniform(box_r, 4.0), &pill);
-            } else if state.chevron_hover > 0.0 {
-                let pill = session.create_solid_brush(with_alpha(
-                    theme.subtle_hover,
-                    state.chevron_hover * chevron_a,
-                ))?;
-                session.fill_rounded_rect(&RoundedRect::uniform(box_r, 4.0), &pill);
-            }
-            let color = if state.chevron_pressed {
-                foreground.text_tertiary
+            lerp(
+                foreground.text_tertiary,
+                foreground.text_secondary,
+                state.hover,
+            )
+        };
+        let brush = session.create_solid_brush(with_alpha(color, chevron_a))?;
+        let saved = session.transform();
+        let centre = Vector2::new(
+            box_r.left + box_r.width() / 2.0,
+            box_r.top + box_r.height() / 2.0,
+        );
+        session.set_transform(&(Matrix3x2::rotation_around(chevron_angle(roll_t), centre) * saved));
+        session.draw_text(glyph, &self.glyph_format, &box_r, &brush);
+        session.set_transform(&saved);
+        Ok(())
+    }
+
+    /// Draws a left tab column `rail_w` DIPs wide down the whole window (`height`): the fence's
+    /// title bar when its tabs are on the left. Each tab is a 32 DIP row inset 4 DIPs from the
+    /// window edge (WinUI NavigationView items), a hairline separates neighbours, the shown tab
+    /// is semibold on the selection fill (`pill` while it glides to a newly selected tab), and
+    /// a tab's own colour is a 6 DIP dot before its name. `expanded` (1 - roll progress) fades
+    /// the line between the column and the items and the shown tab's selection fill, semibold
+    /// caption and up button: a fence collapsed to the column shows its tabs alike.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_tab_list(
+        &self,
+        session: &DrawingSession<'_>,
+        backdrop: &Backdrop<'_>,
+        theme: &Theme,
+        scale: f32,
+        opacity: f32,
+        tint: Option<ColorF>,
+        tabs: &[TabDraw<'_>],
+        pill: Option<(f32, f32)>,
+        halo: Option<&Brush>,
+        rail_w: f32,
+        height: f32,
+        expanded: f32,
+        deco: TitleDeco,
+        state: TitleState,
+    ) -> Result<()> {
+        let px = Px::new(scale);
+        let dark = theme.mode == crate::theme::ThemeMode::Dark;
+        let line = |alpha: f32| {
+            if dark {
+                ColorF::new(1.0, 1.0, 1.0, alpha)
             } else {
-                lerp(
-                    foreground.text_tertiary,
-                    foreground.text_secondary,
-                    state.hover,
-                )
+                ColorF::new(0.0, 0.0, 0.0, alpha)
+            }
+        };
+        // The divider stops short of the window's rounded corners.
+        let expanded = expanded.clamp(0.0, 1.0);
+        if expanded > 0.0 {
+            let inset = theme.corner_radius.max(8.0);
+            let brush = session.create_solid_brush(line(0.18 * expanded))?;
+            session.fill_rect(
+                &Rect::from_xywh(
+                    px.snap(rail_w) - px.hair(),
+                    inset,
+                    px.hair(),
+                    (height - inset * 2.0).max(0.0),
+                ),
+                &brush,
+            );
+        }
+        let row = |y: f32, h: f32| {
+            Rect::from_xywh(
+                RAIL_ROW_INSET,
+                y,
+                (rail_w - RAIL_ROW_INSET - RAIL_ROW_RIGHT).max(0.0),
+                h,
+            )
+        };
+        let separator = session.create_solid_brush(line(if dark { 0.16 } else { 0.13 }))?;
+        for pair in tabs.windows(2) {
+            if pair[0].dragging || pair[1].dragging {
+                continue;
+            }
+            let r = row(pair[0].x, pair[0].w);
+            let y = px.snap((pair[0].x + pair[0].w + pair[1].x) * 0.5);
+            let a = pair[0].alpha.min(pair[1].alpha).clamp(0.0, 1.0);
+            if a > 0.0 {
+                separator.set_color(line(if dark { 0.16 } else { 0.13 } * a));
+                session.fill_rect(
+                    &Rect::from_xywh(r.left + 10.0, y, (r.width() - 20.0).max(0.0), px.hair()),
+                    &separator,
+                );
+            }
+        }
+        let selected = |rect: Rect, a: f32| -> Result<()> {
+            if theme.liquid_glass {
+                draw_header_glass(session, backdrop, theme, scale, 0, rect, 0.78, a)
+            } else {
+                let fill = session.create_solid_brush(with_alpha(theme.tab_active_fill, a))?;
+                session.fill_rounded_rect(
+                    &RoundedRect::uniform(rect, header_control_radius(theme, rect)),
+                    &fill,
+                );
+                Ok(())
+            }
+        };
+        if let Some((y, h)) = pill {
+            selected(row(y, h), expanded)?;
+        }
+        let colored = tabs.iter().any(|t| t.color.is_some());
+        let folders = tabs.iter().any(|t| t.folder_icon);
+        let text_left = rail_text_left(colored, folders);
+        // A dragged tab is always above its neighbours.
+        for tab in tabs
+            .iter()
+            .filter(|t| !t.dragging)
+            .chain(tabs.iter().filter(|t| t.dragging))
+        {
+            let ta = tab.alpha.clamp(0.0, 1.0);
+            if ta <= 0.0 {
+                continue;
+            }
+            let rect = row(tab.x, tab.w);
+            let radius = header_control_radius(theme, rect);
+            // How selected the row looks, and how much of that its own fill shows (none while
+            // the pill glides). Press and hover feedback take the rest: on every row of a
+            // collapsed column, the shown tab's included.
+            let sel = rail_selected(tab.active, tab.dragging, expanded);
+            let own = if pill.is_none() { sel } else { 0.0 };
+            if own > 0.0 {
+                selected(rect, ta * own)?;
+            }
+            if tab.pressed && own < 1.0 {
+                let a = ta * (1.0 - own);
+                let fill = session.create_solid_brush(with_alpha(theme.subtle_pressed, a))?;
+                session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), &fill);
+            } else if tab.hover > 0.0 && sel < 1.0 {
+                let a = tab.hover * ta * (1.0 - sel);
+                let fill = session.create_solid_brush(with_alpha(theme.subtle_hover, a))?;
+                session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), &fill);
+            }
+            if tab.drop_target > 0.0 {
+                let a = tab.drop_target.min(1.0) * ta;
+                let fill = session.create_solid_brush(with_alpha(theme.selection_fill, a))?;
+                session.fill_rounded_rect(&RoundedRect::uniform(rect, radius), &fill);
+                let ring = session.create_solid_brush(with_alpha(theme.selection_stroke, a))?;
+                session.draw_rounded_rect(&px.ring(rect, radius), &ring, px.hair());
+            }
+            if let Some(color) = tab.color {
+                let dot = Rect::from_xywh(
+                    rect.left + 10.0,
+                    rect.top + rect.height() * 0.5 - 3.0,
+                    6.0,
+                    6.0,
+                );
+                let brush = session.create_solid_brush(with_alpha(color, ta))?;
+                session.fill_rounded_rect(&RoundedRect::uniform(dot, 3.0), &brush);
+            }
+            let foreground =
+                header_foreground(backdrop, theme, tab.key, rect, scale, opacity, tint);
+            let color = if tab.pressed && !tab.dragging {
+                foreground.text_secondary
+            } else {
+                tab.title_color.unwrap_or(foreground.text_primary)
             };
-            let brush = session.create_solid_brush(with_alpha(color, chevron_a))?;
-            let saved = session.transform();
-            let centre = Vector2::new(
-                box_r.left + box_r.width() / 2.0,
-                box_r.top + box_r.height() / 2.0,
-            );
-            session.set_transform(
-                &(Matrix3x2::rotation_around(chevron_angle(roll_t), centre) * saved),
-            );
-            session.draw_text("\u{E70E}", &self.glyph_format, &box_r, &brush);
-            session.set_transform(&saved);
+            // A navigated portal's up button ends the shown tab's row (its room stays while the
+            // fence collapses, so the caption does not re-fit at the end).
+            let up = tab.active && deco.up_button;
+            let room = self.rail_title_room(rail_w, colored, folders, tab.badge, up);
+            let caption = Rect::from_xywh(rect.left + text_left, rect.top, room, rect.height());
+            if tab.folder_icon {
+                let brush = session.create_solid_brush(with_alpha(color, ta))?;
+                session.draw_text(
+                    "\u{E8B7}",
+                    &self.title_glyph_format,
+                    &Rect::from_xywh(
+                        caption.left - TAB_ICON_W - 2.0,
+                        rect.top,
+                        TAB_ICON_W,
+                        rect.height(),
+                    ),
+                    &brush,
+                );
+            }
+            // The shown tab's semibold caption cross-fades to the others' regular weight as the
+            // fence collapses to the column.
+            for (strong, a) in [(true, sel), (false, 1.0 - sel)] {
+                let a = a * ta;
+                if a <= 0.0 {
+                    continue;
+                }
+                let brush = session.create_solid_brush(with_alpha(color, a))?;
+                if let Some(halo) = halo {
+                    halo.set_color(halo_color(color, a));
+                }
+                let fmt = self.rail_title_format(tab.title_size, strong);
+                let fitted = crate::text::fit_width(tab.title, fmt, room);
+                draw_caption(
+                    session,
+                    &fitted,
+                    fmt,
+                    &caption,
+                    &brush,
+                    halo,
+                    text_shadow(theme, color),
+                );
+            }
+            // Like the selection fill, the up button is gone from a collapsed column.
+            let up_a = ta * expanded;
+            if up && up_a > 0.0 {
+                // Up (Segoe Fluent E74A): SubtleFill on hover, SubtleFillColorTertiary while
+                // pressed, as in the title row.
+                let box_r = TitleDeco::rail_up_box(rect);
+                let fill = if state.up_pressed {
+                    Some(with_alpha(theme.subtle_pressed, up_a))
+                } else if state.up_hover > 0.0 {
+                    Some(with_alpha(theme.subtle_hover, state.up_hover * up_a))
+                } else {
+                    None
+                };
+                if let Some(fill) = fill {
+                    let brush = session.create_solid_brush(fill)?;
+                    session.fill_rounded_rect(&RoundedRect::uniform(box_r, 4.0), &brush);
+                }
+                let glyph = session.create_solid_brush(with_alpha(
+                    if state.up_pressed {
+                        foreground.text_tertiary
+                    } else {
+                        foreground.text_secondary
+                    },
+                    up_a,
+                ))?;
+                session.draw_text("\u{E74A}", &self.glyph_format, &box_r, &glyph);
+            }
+            if let Some(badge) = tab.badge {
+                let badge_w = self.tab_badge_width(badge) - TAB_BADGE_GAP;
+                let up_w = if up { 26.0 } else { 0.0 };
+                let r = Rect::from_xywh(
+                    rect.right - 8.0 - badge_w - up_w,
+                    rect.top + ((rect.height() - TAB_BADGE_H) * 0.5).round(),
+                    badge_w,
+                    TAB_BADGE_H,
+                );
+                let fill = session.create_solid_brush(with_alpha(theme.accent, ta))?;
+                session.fill_rounded_rect(&RoundedRect::uniform(r, TAB_BADGE_H * 0.5), &fill);
+                // TextOnAccentFillColorPrimary, as on the title-row pills.
+                let on_accent = if dark {
+                    ColorF::from_rgba8(0, 0, 0, 0xFF)
+                } else {
+                    ColorF::from_rgba8(0xFF, 0xFF, 0xFF, 0xFF)
+                };
+                let text = session.create_solid_brush(with_alpha(on_accent, ta))?;
+                session.draw_text(badge, &self.badge_format, &r, &text);
+            }
         }
         Ok(())
     }
@@ -2097,12 +2681,13 @@ impl FenceChrome {
                     .min(rect.width())
                     .max(1.0);
                 let area = Rect::from_xywh(
-                    if right {
-                        rect.right - measured
-                    } else {
-                        rect.left
-                    },
-                    rect.top + theme.title_height,
+                    rows.origin_x
+                        + if right {
+                            rect.right - measured
+                        } else {
+                            rect.left
+                        },
+                    rect.top + rows.origin_y,
                     measured,
                     rect.height(),
                 );
@@ -2131,6 +2716,24 @@ impl FenceChrome {
                 spread,
                 text_shadow(theme, color),
             );
+        };
+        // Dates, types, sizes and the column captions are not shortened like the names: each
+        // is clipped to its column so a long one does not run into the next.
+        let paint_clipped = |text: &str,
+                             format: &TextFormat,
+                             rect: Rect,
+                             key: u128,
+                             alpha: f32,
+                             right: bool|
+         -> Result<()> {
+            let paint = || {
+                paint_text(text, format, rect, key, true, alpha, right);
+                Ok(())
+            };
+            match clip {
+                Some(clip) => clip.scoped(&rect, paint),
+                None => paint(),
+            }
         };
 
         let mut paint_rows = || -> Result<()> {
@@ -2217,49 +2820,48 @@ impl FenceChrome {
                     false,
                 );
                 if let Some((x, w)) = cols.date {
-                    paint_text(
+                    paint_clipped(
                         row.date,
                         &self.row_format,
                         Rect::from_xywh(x, row.y, w, row.h),
                         key + 1,
-                        true,
                         alpha,
                         false,
-                    );
+                    )?;
                 }
                 if let Some((x, w)) = cols.type_ {
-                    paint_text(
+                    paint_clipped(
                         row.type_name,
                         &self.row_format,
                         Rect::from_xywh(x, row.y, w, row.h),
                         key + 2,
-                        true,
                         alpha,
                         false,
-                    );
+                    )?;
                 }
                 if let Some((x, w)) = cols.size {
-                    paint_text(
+                    paint_clipped(
                         row.size,
                         &self.row_format_right,
                         Rect::from_xywh(x, row.y, w, row.h),
                         key + 3,
-                        true,
                         alpha,
                         true,
-                    );
+                    )?;
                 }
                 visible_slot += 1;
             }
             Ok(())
         };
+        let bottom = rows.rows_bottom.min(height);
         match clip {
-            Some(clip) if header_h > 0.0 => {
+            Some(clip) if header_h > 0.0 || bottom < height => {
                 // A row scrolled partly under the fixed header must not paint through its
                 // captions. The header has no opaque fill (the surface is transparent over the
-                // backdrop), so clip the rows to the band below it instead.
+                // backdrop), so clip the rows to the band below it instead (and above the
+                // empty height under the whole rows).
                 clip.scoped(
-                    &Rect::from_xywh(0.0, header_h, width, (height - header_h).max(0.0)),
+                    &Rect::from_xywh(0.0, header_h, width, (bottom - header_h).max(0.0)),
                     paint_rows,
                 )?;
             }
@@ -2339,15 +2941,14 @@ impl FenceChrome {
                 } else {
                     &self.row_format
                 };
-                paint_text(
+                paint_clipped(
                     text,
                     fmt,
                     Rect::from_xywh(x, 0.0, w, header_h - 1.0),
                     0x20000 + index as u128,
-                    true,
                     1.0,
                     right,
-                );
+                )?;
                 if rows.sort_column == Some(col) {
                     // 8 px chevron flush with the header top, horizontally centred in the cell
                     // (the Win32 header control's sort arrow), same grey as the captions.
@@ -2414,10 +3015,12 @@ impl FenceChrome {
     }
 
     /// Draws the item grid into a content surface of `width` x `height` DIPs (origin 0,0).
+    /// `clip` cuts the items off at `content.items_bottom`.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_content(
         &self,
         session: &DrawingSession<'_>,
+        clip: Option<&Clip<'_>>,
         theme: &Theme,
         scale: f32,
         bitmaps: &mut BitmapCache,
@@ -2442,93 +3045,108 @@ impl FenceChrome {
         let label = session.create_solid_brush(theme.text_primary)?;
         let label_dim = session.create_solid_brush(theme.text_secondary)?;
 
-        // "按时间分组" section headers: secondary caption flush with the label inset, then an
-        // Explorer-style hairline to the right margin. Static bands (the items glide), painted
-        // first so an unfolded label may overdraw them like it overdraws the row below.
-        if !content.group_headers.is_empty() {
-            let line = session.create_solid_brush(theme.stroke)?;
-            // The same local halo the labels get over mixed wallpaper.
-            let halo = if (theme.liquid_glass || theme.text_halo)
-                && text_shadow(theme, theme.text_secondary).is_none()
-            {
-                Some(session.create_solid_brush(if theme.text_secondary.r > 0.5 {
-                    ColorF::new(0.0, 0.0, 0.0, 0.28)
+        let mut paint_items = || -> Result<()> {
+            // "按时间分组" section headers: secondary caption flush with the label inset, then an
+            // Explorer-style hairline to the right margin. Static bands (the items glide), painted
+            // first so an unfolded label may overdraw them like it overdraws the row below.
+            if !content.group_headers.is_empty() {
+                let line = session.create_solid_brush(theme.stroke)?;
+                // The same local halo the labels get over mixed wallpaper.
+                let halo = if (theme.liquid_glass || theme.text_halo)
+                    && text_shadow(theme, theme.text_secondary).is_none()
+                {
+                    Some(session.create_solid_brush(if theme.text_secondary.r > 0.5 {
+                        ColorF::new(0.0, 0.0, 0.0, 0.28)
+                    } else {
+                        ColorF::new(1.0, 1.0, 1.0, 0.28)
+                    })?)
                 } else {
-                    ColorF::new(1.0, 1.0, 1.0, 0.28)
-                })?)
-            } else {
-                None
-            };
-            let spread = 1.0 / scale.max(1.0);
-            let text_x = ICON_LABEL_SIDE_INSET;
-            let right = width - 8.0;
-            for h in content.group_headers {
-                if h.y + h.h <= 0.0 || h.y > height {
-                    continue;
-                }
-                let text_w = crate::text::measure_width(h.text, &self.group_format)
-                    .min((right - text_x).max(1.0))
-                    .max(1.0);
-                let rect = Rect::from_xywh(text_x, h.y, text_w, h.h);
-                draw_legible_text(
-                    session,
-                    h.text,
-                    &self.group_format,
-                    &rect,
-                    &label_dim,
-                    halo.as_ref(),
-                    spread,
-                    text_shadow(theme, theme.text_secondary),
-                );
-                draw_group_rule(session, px, h, text_x + text_w, right, &line);
-            }
-        }
-
-        // The cell whose label unfolds is painted after every other cell: like the desktop's
-        // focused icon it overdraws the row below.
-        let visible = |cell: &ItemCell<'_>| cell.y + cell.h >= 0.0 && cell.y <= height;
-        let deferred = content
-            .items
-            .iter()
-            .find(|c| visible(c) && c.full_label.is_some());
-        // A fixed 文字颜色 shadows every resting label in one pass; the unfolding one draws its
-        // own above the row it overlaps.
-        let shadowed = text_shadow(theme, theme.text_primary).is_some_and(|shadow| {
-            let format = &self.label_font.borrow().format;
-            draw_text_shadow(session, shadow, || {
-                for cell in content.items.iter().filter(|c| visible(c)) {
-                    let alpha = cell.alpha.clamp(0.0, 1.0);
-                    if alpha <= 0.0 || deferred.is_some_and(|d| std::ptr::eq(d, cell)) {
+                    None
+                };
+                let spread = 1.0 / scale.max(1.0);
+                let text_x = ICON_LABEL_SIDE_INSET;
+                let right = width - 8.0;
+                for h in content.group_headers {
+                    if h.y + h.h <= 0.0 || h.y > height {
                         continue;
                     }
-                    let rect = self.label_rect(content, cell, None);
-                    // A brush of its own per fading label: the list may keep brushes by
-                    // reference, so the scratch brush cannot be recoloured mid-recording.
-                    let fading = (alpha < 1.0)
-                        .then(|| session.create_solid_brush(ColorF::new(0.0, 0.0, 0.0, alpha)))
-                        .and_then(|b| b.ok());
-                    session.draw_text(cell.label, format, &rect, fading.as_ref().unwrap_or(&label));
+                    let text_w = crate::text::measure_width(h.text, &self.group_format)
+                        .min((right - text_x).max(1.0))
+                        .max(1.0);
+                    let rect = Rect::from_xywh(text_x, h.y, text_w, h.h);
+                    draw_legible_text(
+                        session,
+                        h.text,
+                        &self.group_format,
+                        &rect,
+                        &label_dim,
+                        halo.as_ref(),
+                        spread,
+                        text_shadow(theme, theme.text_secondary),
+                    );
+                    draw_group_rule(session, px, h, text_x + text_w, right, &line);
                 }
-            })
-            .is_ok()
-        });
-        for cell in content.items {
-            if !visible(cell) || deferred.is_some_and(|d| std::ptr::eq(d, cell)) {
-                continue;
             }
-            self.draw_cell(
-                session, theme, bitmaps, &state, px, content, cell, &label, &label_dim, None,
-                shadowed,
-            )?;
-        }
-        if let Some(cell) = deferred {
-            // The caller measured the unfolded text when it fitted it (`fit_lines_counted`):
-            // no second layout per frame here.
-            let unfold = cell.full_label.map(|(text, lines)| (text, lines.max(1)));
-            self.draw_cell(
-                session, theme, bitmaps, &state, px, content, cell, &label, &label_dim, unfold,
-                shadowed,
-            )?;
+
+            // The cell whose label unfolds is painted after every other cell: like the desktop's
+            // focused icon it overdraws the row below.
+            let visible = |cell: &ItemCell<'_>| cell.y + cell.h >= 0.0 && cell.y <= height;
+            let deferred = content
+                .items
+                .iter()
+                .find(|c| visible(c) && c.full_label.is_some());
+            // A fixed 文字颜色 shadows every resting label in one pass; the unfolding one draws
+            // its own above the row it overlaps.
+            let shadowed = text_shadow(theme, theme.text_primary).is_some_and(|shadow| {
+                let format = &self.label_font.borrow().format;
+                draw_text_shadow(session, shadow, || {
+                    for cell in content.items.iter().filter(|c| visible(c)) {
+                        let alpha = cell.alpha.clamp(0.0, 1.0);
+                        if alpha <= 0.0 || deferred.is_some_and(|d| std::ptr::eq(d, cell)) {
+                            continue;
+                        }
+                        let rect = self.label_rect(content, cell, None);
+                        // A brush of its own per fading label: the list may keep brushes by
+                        // reference, so the scratch brush cannot be recoloured mid-recording.
+                        let fading = (alpha < 1.0)
+                            .then(|| session.create_solid_brush(ColorF::new(0.0, 0.0, 0.0, alpha)))
+                            .and_then(|b| b.ok());
+                        session.draw_text(
+                            cell.label,
+                            format,
+                            &rect,
+                            fading.as_ref().unwrap_or(&label),
+                        );
+                    }
+                })
+                .is_ok()
+            });
+            for cell in content.items {
+                if !visible(cell) || deferred.is_some_and(|d| std::ptr::eq(d, cell)) {
+                    continue;
+                }
+                self.draw_cell(
+                    session, theme, bitmaps, &state, px, content, cell, &label, &label_dim, None,
+                    shadowed,
+                )?;
+            }
+            if let Some(cell) = deferred {
+                // The caller measured the unfolded text when it fitted it (`fit_lines_counted`):
+                // no second layout per frame here.
+                let unfold = cell.full_label.map(|(text, lines)| (text, lines.max(1)));
+                self.draw_cell(
+                    session, theme, bitmaps, &state, px, content, cell, &label, &label_dim, unfold,
+                    shadowed,
+                )?;
+            }
+            Ok(())
+        };
+        match clip {
+            Some(clip) if content.items_bottom < height => clip.scoped(
+                &Rect::from_xywh(0.0, 0.0, width, content.items_bottom.max(0.0)),
+                paint_items,
+            )?,
+            _ => paint_items()?,
         }
 
         if let Some(m) = content.marquee
@@ -2659,11 +3277,8 @@ impl FenceChrome {
         };
         // A local halo protects labels over mixed light/dark wallpaper (Liquid Glass, a fully
         // transparent plate). It does not frost or darken the glass between icons.
-        let halo = if !shadowed && (theme.liquid_glass || theme.text_halo) {
-            Some(session.create_solid_brush(halo_color(theme.text_primary, alpha))?)
-        } else {
-            None
-        };
+        let halo = (!shadowed && (theme.liquid_glass || theme.text_halo))
+            .then(|| state.halo(halo_color(theme.text_primary, alpha)));
         // Resting labels were shadowed in one pass before the cells.
         let shadow = if shadowed && unfold.is_some() {
             text_shadow(theme, theme.text_primary)
@@ -2676,7 +3291,7 @@ impl FenceChrome {
             &self.label_font.borrow().format,
             &label_rect,
             brush,
-            halo.as_ref(),
+            halo,
             shadow,
         );
 
@@ -2780,6 +3395,9 @@ mod tests {
         assert_eq!(header_count_width(136.0, 1, 16.0), 0.0);
         assert_eq!(header_count_width(136.0, 2, 16.0), 0.0);
         assert_eq!(header_count_width(400.0, 2, 16.0), ROLLED_COUNT_W);
+        // Six tabs scroll beside the count instead of shrinking under it.
+        assert_eq!(header_count_width(320.0, 6, 16.0), ROLLED_COUNT_W);
+        assert_eq!(header_count_width(200.0, 6, 16.0), 0.0);
     }
 
     #[test]
@@ -2794,14 +3412,31 @@ mod tests {
             // padding shrinks so the two characters still fit.
             let squeezed = caption + TAB_TEXT_MIN_PADDING + 1.0;
             assert!(tab_text_inset(&theme, squeezed, caption) < full);
-            assert!(chrome.tab_title_fits("游戏", squeezed, 1, &theme));
+            assert!(chrome.tab_title_fits("游戏", squeezed, 1, false, &theme));
             // Below the minimum padding the caption is elided, never drawn over the edge.
             assert_eq!(
                 tab_text_inset(&theme, caption, caption),
                 TAB_TEXT_MIN_PADDING
             );
-            assert!(!chrome.tab_title_fits("游戏", caption, 1, &theme));
+            assert!(!chrome.tab_title_fits("游戏", caption, 1, false, &theme));
+            // A folder tab's glyph takes its room from the caption.
+            assert!(chrome.tab_title_fits("游戏", squeezed + TAB_ICON_W, 1, true, &theme));
+            assert!(!chrome.tab_title_fits("游戏", squeezed, 1, true, &theme));
         }
+    }
+
+    #[test]
+    fn left_column_names_stay_aligned_after_a_dot_and_a_folder_glyph() {
+        assert_eq!(rail_text_left(false, false), 10.0);
+        assert_eq!(rail_text_left(true, false), 24.0);
+        assert_eq!(rail_text_left(false, true), 10.0 + TAB_ICON_W);
+        assert_eq!(rail_text_left(true, true), 24.0 + TAB_ICON_W);
+        let chrome = FenceChrome::new().unwrap();
+        assert_eq!(
+            chrome.rail_title_room(160.0, true, false, None, false)
+                - chrome.rail_title_room(160.0, true, true, None, false),
+            TAB_ICON_W
+        );
     }
 
     #[test]
@@ -2812,6 +3447,41 @@ mod tests {
         // Overshooting curves stay inside the half turn.
         assert_eq!(chevron_angle(1.2), 180.0);
         assert_eq!(chevron_angle(-0.1), 0.0);
+    }
+
+    /// The column's chevron is centred in the room under the tabs; while the window is shorter
+    /// than that (mid collapse or expand) it stays under the last tab, hidden by the bottom edge.
+    #[test]
+    fn rail_chevron_stays_under_the_last_tab() {
+        let r = TitleDeco::rail_chevron_box(100.0, 200.0, 76.0);
+        assert_eq!((r.left, r.top, r.width()), (34.0, 162.0, 32.0));
+        assert_eq!(TitleDeco::rail_chevron_box(100.0, 84.0, 76.0).top, 82.0);
+    }
+
+    /// Collapsed to its column, a fence marks no tab as the shown one; a dragged tab keeps its
+    /// fill throughout.
+    #[test]
+    fn collapsed_column_shows_its_tabs_alike() {
+        assert_eq!(rail_selected(true, false, 1.0), 1.0);
+        assert_eq!(rail_selected(true, false, 0.25), 0.25);
+        assert_eq!(rail_selected(true, false, 0.0), 0.0);
+        assert_eq!(rail_selected(false, false, 1.0), 0.0);
+        assert_eq!(rail_selected(false, true, 0.0), 1.0);
+        assert_eq!(rail_selected(true, false, 1.3), 1.0);
+    }
+
+    /// A left tab column shows its chevron on hover while expanded and none once collapsed to
+    /// the column; in between it fades with the roll, never popping at either end.
+    #[test]
+    fn rail_chevron_fades_with_the_collapse() {
+        assert_eq!(rail_chevron_alpha(1.0, 0.0), 1.0);
+        assert_eq!(rail_chevron_alpha(0.0, 0.0), 0.0);
+        assert_eq!(rail_chevron_alpha(1.0, 1.0), 0.0);
+        assert_eq!(rail_chevron_alpha(1.0, 0.25), 0.75);
+        assert_eq!(rail_chevron_alpha(0.5, 0.5), 0.25);
+        // Overshooting curves stay inside 0..=1.
+        assert_eq!(rail_chevron_alpha(1.0, 1.2), 0.0);
+        assert_eq!(rail_chevron_alpha(1.0, -0.1), 1.0);
     }
 
     /// The thumb keeps its centre while it widens, and that centre is the 12 DIP track's

@@ -150,10 +150,9 @@ impl App {
         .item(
             CMD_PEEK,
             &match self.peek_hotkey {
-                Some(h) => pecofence_core::i18n::format(
-                    "速览所有栅栏\t{0}",
-                    &[peek_hotkey_label(h).to_string()],
-                ),
+                Some(h) => {
+                    pecofence_core::i18n::format("速览所有栅栏\t{0}", &[peek_hotkey_label(h)])
+                }
                 None => pecofence_core::i18n::text("速览所有栅栏").to_string(),
             },
             false,
@@ -210,6 +209,9 @@ impl App {
                 false,
             )
             .icon(glyph::EXIT);
+        // A sign-out while a menu is open ends the process before the menu returns, and the
+        // menu keeps TIMER_SAVE from saving meanwhile: save pending changes first.
+        self.state.save_if_dirty();
         let cmd = menu.show(self.control.hwnd(), x, y);
         match cmd {
             CMD_TOGGLE_FENCES => self.toggle_all_fences(),
@@ -241,6 +243,8 @@ impl App {
             .window_for(fence)
             .map(|w| w.hwnd())
             .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
         let cmd = menu.show_context(owner, x, y);
         if let Some(sm) = shell_menu.as_ref()
             && sm.contains(cmd)
@@ -259,7 +263,7 @@ impl App {
                 .iter()
                 .any(|id| self.state.item(*id).is_some_and(|it| it.is_namespace()))
             {
-                window::post_message(self.control.hwnd(), WM_APP_FS_CHANGED, 0, 0);
+                window::post_message(self.control.hwnd(), WM_APP_FS_CHANGED, 1, 0);
             }
             return;
         }
@@ -267,13 +271,13 @@ impl App {
         match cmd {
             CMD_ITEM_OPEN => {
                 for id in &items {
-                    self.launch(*id);
+                    self.launch(*id, fence);
                 }
             }
             CMD_ITEM_LOCATION => {
                 if let Some(item) = items.first().and_then(|id| self.state.item(*id))
                     && !item.is_namespace()
-                    && let Some(p) = item.key.as_path()
+                    && let Some(p) = item.path()
                 {
                     use std::os::windows::process::CommandExt;
                     // `/select,"<path>"`: quoted as a whole (what `arg` does for a name with
@@ -317,7 +321,7 @@ impl App {
                 .state
                 .item(*only)
                 .filter(|it| it.is_folder)
-                .and_then(|it| it.key.as_path().map(PathBuf::from)),
+                .and_then(|it| it.path().map(PathBuf::from)),
             _ => None,
         }
     }
@@ -659,19 +663,22 @@ impl App {
         if tabs.len() >= 2 || !other_hosts.is_empty() {
             let tab_menu = PopupMenu::new();
             if tabs.len() >= 2 {
+                // A left tab column moves its tabs up and down.
+                let (earlier, later) =
+                    if self.ctx.behavior.tab_bar.get() == pecofence_core::TabBar::Left {
+                        (
+                            pecofence_core::i18n::text("上移"),
+                            pecofence_core::i18n::text("下移"),
+                        )
+                    } else {
+                        (
+                            pecofence_core::i18n::text("左移"),
+                            pecofence_core::i18n::text("右移"),
+                        )
+                    };
                 tab_menu
-                    .item(
-                        CMD_TAB_MOVE_LEFT,
-                        pecofence_core::i18n::text("左移"),
-                        false,
-                        tab_idx == 0,
-                    )
-                    .item(
-                        CMD_TAB_MOVE_RIGHT,
-                        pecofence_core::i18n::text("右移"),
-                        false,
-                        tab_idx + 1 >= tabs.len(),
-                    )
+                    .item(CMD_TAB_MOVE_LEFT, earlier, false, tab_idx == 0)
+                    .item(CMD_TAB_MOVE_RIGHT, later, false, tab_idx + 1 >= tabs.len())
                     .item(
                         CMD_TAB_DETACH,
                         pecofence_core::i18n::text("拆出为独立栅栏"),
@@ -746,6 +753,8 @@ impl App {
             .get(&host)
             .map(|w| w.hwnd())
             .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
         let cmd = menu.show_context(owner, x, y);
         match cmd {
             CMD_FENCE_ROLL => self.toggle_roll(host),
@@ -776,9 +785,15 @@ impl App {
                 && c < CMD_TAB_ATTACH_BASE + self.state.host_fences().len() as u32 =>
             {
                 let idx = (c - CMD_TAB_ATTACH_BASE) as usize;
+                // The merged window's tabs in their order (attach_tab adds them in storage
+                // order, which may interleave them with the target's tabs).
+                let moved = self.state.tabs_of(fence);
                 if let Some(target) = self.state.host_fences().get(idx).map(|o| o.id)
                     && self.state.attach_tab(fence, target)
                 {
+                    for tab in &moved {
+                        self.state.reorder_tab(target, *tab, usize::MAX);
+                    }
                     // The merged fence's own window (if it had one) goes away in resync.
                     self.resync_windows();
                     self.apply_fence_view(target);
@@ -910,6 +925,8 @@ impl App {
             .window_for(fence)
             .map(|w| w.hwnd())
             .unwrap_or(self.control.hwnd());
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
         let cmd = menu.show_context(owner, x, y);
         match cmd {
             CMD_COL_DATE | CMD_COL_TYPE | CMD_COL_SIZE => {
@@ -962,6 +979,8 @@ impl App {
             false,
             false,
         );
+        // Saved first, as for the tray menu.
+        self.state.save_if_dirty();
         if menu.show_context(owner, pt.x, pt.y) == CMD_NEW_FENCE_HERE {
             self.create_fence_with_rename(rect);
         }

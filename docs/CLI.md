@@ -65,10 +65,15 @@ contents or undoes real file moves through folder portals.
 
 ## How it talks to the app
 
-The app listens on the named pipe `\\.\pipe\PecoFence` (or `\\.\pipe\PecoFence.<instance>` for a
-named test instance). Every CLI call opens one connection, sends one JSON request line, reads one
-JSON response line and exits; there is no daemon and nothing stays resident. Requests are executed on
-the app's UI thread, so while a PecoFence context menu or dialog is open the reply waits; after
+The app listens on the named pipe `\\.\pipe\PecoFence.<SID>` (or `\\.\pipe\PecoFence.<SID>.<instance>`
+for a named test instance), where `<SID>` is the security identifier of the Windows account it runs
+as (`S-1-5-21-...`, shown by `whoami /user`). Pipe names are shared by the whole computer; the SID
+keeps the PecoFence of two accounts signed in at the same time apart, and the CLI reaches the
+instance of the account it runs as from any session, an ssh login included. Only that account,
+SYSTEM and elevated administrators can open the pipe.
+
+Every CLI call opens one connection, sends one JSON request line, reads one JSON response line and
+exits; there is no daemon and nothing stays resident. Requests are executed on the app's UI thread, so while a PecoFence context menu or dialog is open the reply waits; after
 `--timeout` (default 15 s) the CLI gives up with exit code 4 and the app discards the request instead
 of running it late. A request the app picked up right before that deadline may still have run, so
 after an exit 4 read the state back (`fence list`) before retrying a mutation.
@@ -200,29 +205,59 @@ where each move has `item`, `name`, `path`, `from`/`fromTitle`, `to`/`toTitle`, 
 (`null` = the default target). Nothing moves and no snapshot is taken. Without `--dry-run` the same
 `moves` list describes what happened.
 
+An item no rule matches goes to `defaultTarget` (the inbox). With `"unmatched": "stay"` in the rule set
+(Settings › 整理规则 › 没有命中规则的项目 › 留在当前栅栏; the default is `"defaultTarget"`), applying the
+rules leaves such an item in the fence it is in, so disabling a rule no longer sends the items it filed
+back to the inbox. An item in no fence yet still goes to `defaultTarget`. `rule list` shows the value;
+change it in Settings or with `rule import` of an edited `rule list`.
+
 `rule add --index 0` inserts the new rule ahead of existing rules in the same priority class, so a
 PDF rule can take precedence over an existing Documents rule. Without `--index`, the rule is appended.
 
 `rule add` conditions (all must match): `--ext pdf,docx`, `--type programs,folders,documents,images,
 music,video,archives,shortcuts,installers`, `--name-contains`, `--name-not-contains`, `--starts-with`,
-`--ends-with`, `--name-is`, `--glob "*.bak"`, `--folders-only` / `--files-only`, and `--json` with an
-array of `Cond` objects (`describe --schema Cond`) for everything else (size, creation time, idle days).
+`--ends-with`, `--name-is`, `--glob "*.bak"`, `--folders-only` / `--files-only`, `--plain-files`, and
+`--json` with an array of `Cond` objects (`describe --schema Cond`) for everything else (size, creation
+time, idle days). `--plain-files` (`plainFiles`) matches a file that is not a folder, a program (the
+`programs` type), a shortcut (`.lnk`, `.url`, `.website`) or This PC and friends; rules are first match,
+so a `--plain-files` rule added last takes every file the rules before it left, unknown extensions
+included. `config.json` and `config export` files write this condition as
+`{"cond":"filesOnly","plain":true}`, so 0.2.1 and older still open them (and read the rule as
+`--files-only`); `rule list`, `rule import` and `--json` use `{"cond":"plainFiles"}`.
 
 `rule import` reads UTF-8 (a BOM is fine). Windows PowerShell 5 writes UTF-16 with `>`; such a file
 is rejected with `invalid_value` and the hint to re-save it (`| Set-Content -Encoding utf8`).
 
 `settings set` paths are dotted camelCase keys of the Settings object, e.g. `iconSize`, `theme`,
-`themeStyle`, `hideRealIcons`, `autostart`, `peek.enabled`, `quickHide.enabled`,
+`themeStyle`, `hideRealIcons`, `hideInboxWhenIconsShown` (while `hideRealIcons` is off, the inbox
+fence shows no window and its items only show among the Windows desktop icons; a tab or a host of
+tabs stays; default off), `offerNewFence` (a rectangle drawn on empty desktop that touches no fence
+offers 「在此新建栅栏」; default on), `autostart`, `peek.enabled`, `quickHide.enabled`,
 `titleAlign` (left/center/right: the title and tab strip in every title row),
+`labelColor` (auto/white/black: the item names in every fence and view; auto picks dark or light
+names from the wallpaper in Liquid Glass and follows the colour mode in Fluent; fence titles keep
+their `titleColor`; default auto),
+`tabBar` (top/left: a fence with two or more tabs shows them in its title row, or lists them in a
+column on its left that takes the title row's place; rolled up, such a fence shrinks to the
+column; default top),
 `textColor` (adaptive/perFence/light/dark: text colour on Liquid Glass fences; anything but
 `adaptive` draws a soft shadow under the text instead of the outline),
 `rollUp.hoverPeek`, `rollUp.clickToExpand`, `rollUp.pushNeighbors` (an expanded fence pushes the
 fences stacked below it down and they slide back when it rolls up; their `rect` stays where it was,
 default on), `rollUp.titleOnHover` (the title row folds away until the
-pointer is over the fence; for every fence whose `titleOnHover` is `default`), `snapping.enabled`, `snapping.gapPx` (the gap, in DIPs,
+pointer is over the fence; for every fence whose `titleOnHover` is `default`),
+`rollUp.hideCountAndChevron` (no item count on a rolled title and no roll-up chevron, so the title
+bar shows the name only; double-clicking the title and the fence menu still roll up; default off), `snapping.enabled`, `snapping.gapPx` (the gap, in DIPs,
 fences keep to each other and the screen edges while snapping; 0 to 64, default 8),
 `snapping.sizeToCells` (resizing keeps whole icon columns and rows), `snapping.guideLines`
-(alignment guides while dragging, default on), `icons.chameleon`.
+(alignment guides while dragging, default on), `icons.chameleon`,
+`icons.shortcutArrows` (Windows' shortcut arrow on the icons of shortcuts, default on), `peek.customHotkey` (the Peek
+shortcut as text such as `Ctrl+Shift+F` or `Win+Alt+Space`: Ctrl, Alt or Win plus a letter, digit,
+F1 to F24, Num0 to Num9, Space, Enter, Tab, Esc, Backspace, Insert, Delete, Home, End, PageUp,
+PageDown or an arrow key; `null` goes back to `peek.hotkey`, whose default is Ctrl+Alt+Space, and
+setting `peek.hotkey` clears it). A
+combination Windows or another program holds is refused with `validation_failed`, like common
+Windows shortcuts (Ctrl+Space, Alt+Tab, Win plus one key).
 `describe --schema Settings` lists them all with their allowed values (the name is matched
 case-insensitively; an unknown name is a `usage` error listing `details.allowed`).
 
@@ -290,7 +325,8 @@ Everything talks to the running app except `describe`, `skill`, `paths`, `log` a
   the app would (exit 1 with `validation_failed` when the app would refuse it), then lints what
   loads but will not work: rules whose target fence exists in no layout, rules targeting a folder
   portal (error), rules without conditions, portals whose folder is missing, tabs hosted by a
-  missing fence, memberships of unknown items, more than 20 snapshots, a missing or foreign
+  missing fence, fence sizes outside 1 to 8192 DIP (the app clamps them when it loads the file),
+  memberships of unknown items, more than 20 snapshots, a missing or foreign
   `$schema`. Output: `{"ok", "path", "schema", "summary": {...}, "problems": [{"level":
   "error"|"warning", "subject", "message"}]}`; exit 1 when any problem is an error. Run it before
   `config import`.
@@ -342,7 +378,7 @@ The app ignores the field's value.
 
 | `code` | Meaning |
 |---|---|
-| `not_running` | No PecoFence instance is listening on the pipe (checked by the CLI). |
+| `not_running` | No PecoFence instance of this Windows account is listening on the pipe (checked by the CLI). |
 | `timeout` | No reply within `--timeout`; the app is probably inside a menu or dialog. |
 | `busy` | Too many concurrent CLI connections; retry shortly. |
 | `usage` | Malformed request, unknown method, missing or mistyped parameter. |
@@ -395,7 +431,7 @@ be undone. Snapshots do not include settings, rules, or files moved through port
 ## Test instances
 
 `PECOFENCE_INSTANCE=<name> pecofence.exe ...` starts an independent instance with its own pipe
-`\\.\pipe\PecoFence.<name>`. `pecofence-cli --instance <name>` (or the same environment variable)
+`\\.\pipe\PecoFence.<SID>.<name>`. `pecofence-cli --instance <name>` (or the same environment variable)
 addresses it. This exists for development and automated tests; a normal installation has exactly one
 instance and needs neither.
 

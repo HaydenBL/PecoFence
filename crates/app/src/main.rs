@@ -70,7 +70,23 @@ fn start_log(
 ) -> Option<std::fs::File> {
     use pecofence_core::brand::log_file_name;
     let path = dir.join(log_file_name(instance, current));
-    let _ = std::fs::rename(&path, dir.join(log_file_name(instance, previous)));
+    let prev = dir.join(log_file_name(instance, previous));
+    // The Store edition installed on another drive cannot rename files in its copy of
+    // %LOCALAPPDATA% (os error 17), and a viewer that holds the log without delete sharing
+    // blocks the rename too: keep a copy instead.
+    let kept = match std::fs::rename(&path, &prev) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => std::fs::copy(&path, &prev).is_ok(),
+    };
+    if !kept {
+        // Write on after the last run's lines rather than erase them.
+        return std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .ok();
+    }
     std::fs::File::create(path).ok()
 }
 
@@ -150,10 +166,13 @@ fn show_running_settings(instance: Option<&str>) {
     const STARTUP: std::time::Duration = std::time::Duration::from_secs(30);
     pecofence_platform::process::allow_foreground_handoff();
     let request = pecofence_ipc::Request::new(pecofence_ipc::Method::SettingsOpenUi);
+    let Ok(name) = pecofence_platform::pipe::ipc_pipe_name(instance) else {
+        return;
+    };
     let pipe = std::fs::OpenOptions::new()
         .write(true)
         .security_qos_flags(SECURITY_IDENTIFICATION)
-        .open(pecofence_core::brand::ipc_pipe_name(instance));
+        .open(name);
     let Ok(mut pipe) = pipe else {
         return;
     };

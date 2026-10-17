@@ -127,6 +127,16 @@ fn marquee_rect(a: POINT, b: POINT) -> RECT {
     }
 }
 
+/// A press on one of Windows' own desktop icons (they show while 「隐藏 Windows 桌面图标」 is off)
+/// selects, opens or drags that icon: it starts no marquee and counts for no quick hide.
+fn on_icon(hit: HWND, pt: POINT) -> bool {
+    let on = shell_icons::desktop_icon_hovered(hit);
+    if on {
+        tracing::debug!(?pt, "press on a Windows desktop icon");
+    }
+    on
+}
+
 /// Ctrl or Shift is down (physical state; the desktop, not us, has the keyboard focus).
 fn additive_modifier() -> bool {
     window::key_down_async(msg::VK_CONTROL) || window::key_down_async(msg::VK_SHIFT)
@@ -204,6 +214,9 @@ pub struct DesktopAnchor {
     /// Foreground transitions also signal virtual-desktop switches before registry writes
     /// (called with the new foreground window).
     pub on_foreground_changed: Option<Box<dyn Fn(HWND)>>,
+    /// The desktop came to the front: clicked, or shown with Win+D (which Windows 10 does not
+    /// always report as a foreground change).
+    pub on_desktop_front: Option<Box<dyn Fn()>>,
     /// The last refused placement above the host (window above it, HRESULT), logged once until
     /// the cause changes or the placement works again.
     anchor_refused: Option<(isize, i32)>,
@@ -225,6 +238,13 @@ pub struct WindowReport {
     pub peeking: bool,
     pub show_desktop: bool,
     pub host: Option<desktop::HostKind>,
+}
+
+/// Windows 11's shell popups (snap layouts after Win+Up, the task switcher) take the foreground
+/// for a moment and hand it back without another foreground event. Taken for an app, they ended
+/// a Peek, turned the desktop's double-click off, or ended show desktop.
+fn is_shell_popup(class: &str) -> bool {
+    class == "XamlExplorerHostIslandWindow"
 }
 
 impl DesktopAnchor {
@@ -322,6 +342,7 @@ impl DesktopAnchor {
             peek_shown: Vec::new(),
             on_peek_interrupted: None,
             on_foreground_changed: None,
+            on_desktop_front: None,
             anchor_refused: None,
             topmost_refused: false,
         };
@@ -553,6 +574,9 @@ impl DesktopAnchor {
         if !self.show_desktop_active {
             if self.desktop_is_raised_over_us() && self.is_desktop_window(foreground) {
                 self.show_desktop_active = true;
+                if let Some(callback) = self.on_desktop_front.as_ref() {
+                    callback();
+                }
                 match self.behavior {
                     ShowDesktopBehavior::KeepVisible => {
                         tracing::info!("show desktop: floating the fences above the raised desktop")
@@ -565,6 +589,7 @@ impl DesktopAnchor {
         } else if !foreground.0.is_null()
             && !self.is_desktop_window(foreground)
             && !self.is_own_window(foreground)
+            && !is_shell_popup(desktop::class_name(desktop::root_ancestor(foreground)).as_str())
         {
             self.end_show_desktop("another window came to the front");
         }
@@ -614,6 +639,11 @@ impl DesktopAnchor {
         }
         let root = desktop::root_ancestor(hwnd);
         let cls = desktop::class_name(root);
+        // The window the user goes to from a shell popup is the real change.
+        if is_shell_popup(&cls) {
+            tracing::debug!(%cls, "shell popup in front; foreground change ignored");
+            return;
+        }
         if self.peeking {
             // Peek is a glance: the first foreign window that comes to the front ends it. Our
             // own windows (fences, dimmer, rename popup, menus) do not.
@@ -634,6 +664,9 @@ impl DesktopAnchor {
         tracing::debug!(?hwnd, %cls, is_desktop, raised, "foreground changed");
 
         if is_desktop {
+            if let Some(callback) = self.on_desktop_front.as_ref() {
+                callback();
+            }
             self.set_raw_input_sink(true);
             let pt = window::cursor_pos();
             self.quick.pending_click = Some((Instant::now(), pt));
@@ -677,7 +710,10 @@ impl DesktopAnchor {
                     let _ = desktop::set_topmost(*w, true);
                 }
                 for (f, shadow) in s.fences.clone() {
-                    if !desktop::is_visible(f) {
+                    // One that quick hide is still fading out is visible until the fade ends.
+                    let quick_hidden =
+                        s.quick.fences_hidden && !s.quick_hide_excluded.contains(&(f.0 as isize));
+                    if !desktop::is_visible(f) || quick_hidden {
                         // Quick-hidden: fade it in for the peek (its shadow follows on its own).
                         set_fence_visible(f, shadow, true);
                         s.peek_shown.push(f);
@@ -705,6 +741,9 @@ impl DesktopAnchor {
                     set_fence_visible(h, shadow, false);
                 }
             });
+            // Show desktop may have ended during the peek, which suspends its checks; left
+            // active, the fences would float above the window that came to the front.
+            self.check_show_desktop();
             self.reanchor("peek off");
             tracing::info!("peek off");
         }
@@ -825,12 +864,13 @@ impl DesktopAnchor {
         }
     }
 
-    /// The left button is down at `pt`. On the bare desktop (not over one of our windows) a
-    /// marquee may start there while the fences show; returns false anywhere else.
+    /// The left button is down at `pt`. On the bare desktop (not over one of our windows or one
+    /// of Windows' own icons) a marquee may start there while the fences show; returns false
+    /// anywhere else.
     fn begin_marquee(&mut self, pt: POINT) -> bool {
         let hit = desktop::window_from_point(pt.x, pt.y);
         let root = desktop::root_ancestor(hit);
-        if self.all_windows().contains(&root) || !self.is_desktop_window(hit) {
+        if self.all_windows().contains(&root) || !self.is_desktop_window(hit) || on_icon(hit, pt) {
             self.quick.marquee_origin = None;
             self.quick.marquee_live = false;
             return false;
@@ -929,6 +969,8 @@ impl DesktopAnchor {
             set_fence_visible(w, shadow, !hide);
         }
         if !hide {
+            // Shown during a peek: ending it must not hide them again.
+            self.peek_shown.clear();
             self.reanchor("fences shown again");
         }
         tracing::info!(
@@ -989,8 +1031,8 @@ impl DesktopAnchor {
         false
     }
 
-    /// True after the retry budget was exhausted without success (caller should reset the
-    /// setting and tell the user).
+    /// True after the retry budget was exhausted without success (caller should stop the
+    /// retries and tell the user).
     pub fn hide_desktop_icons_gave_up(&self) -> bool {
         self.icons.pending && self.icons.pending_attempts >= HIDE_ICONS_MAX_ATTEMPTS
     }
@@ -1061,6 +1103,14 @@ impl DesktopAnchor {
     /// True when a previous run left the marker behind (crashed without restoring).
     pub fn stale_marker_present(&self) -> bool {
         self.icons.marker.exists()
+    }
+
+    /// The previous run's marker with the icons showing anyway: it restored them but was ended
+    /// before it removed the marker. Kept, it would take a later hide by the user for ours.
+    pub fn forget_stale_marker(&mut self) {
+        if !self.icons.we_hid_them {
+            let _ = std::fs::remove_file(&self.icons.marker);
+        }
     }
 
     fn on_timer(&mut self, id: usize) {
