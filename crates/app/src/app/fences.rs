@@ -76,7 +76,8 @@ impl App {
         self.ensure_portal_watchers();
         self.state.normalize_tabs();
         // Only host fences own a window; fences hosted as tabs live inside their host's. An
-        // empty inbox set to 为空时自动隐藏 has none until something lands in it.
+        // empty inbox set to 为空时自动隐藏 has none until something lands in it, and one
+        // hidden beside the Windows icons none until they are hidden again.
         let hidden = self.state.hidden_inbox();
         let mut hosts = self.state.host_fences();
         hosts.retain(|f| Some(f.id) != hidden);
@@ -161,12 +162,17 @@ impl App {
         let host = self.state.host_of(id);
         let active = self.state.active_tab_of(host);
         if let Some(w) = self.fences.get(&host) {
+            let switching = w.active_fence() != active;
             w.set_tabs(self.tab_views(host), active);
             if active == id
                 && let Some(f) = self.state.fence(id)
             {
                 // Grouping first: the layout glide must target the new sections.
                 w.set_group_by_date(f.view.group_by_date);
+                if switching {
+                    // After `set_tabs`, whose content swap draws the outgoing items once more.
+                    w.set_incoming_tab_view(f.view.icon_size, f.view.layout);
+                }
                 w.set_items(self.item_views(f));
                 w.set_sort_indicator(f.view.sort, f.view.reverse);
             }
@@ -177,7 +183,8 @@ impl App {
     }
 
     /// 为空时自动隐藏: the inbox window goes with its last item and comes back with the next
-    /// one (or when the flag is switched off).
+    /// one (or when the flag is switched off). Also when the inbox's hiding beside the Windows
+    /// icons starts or ends.
     pub(super) fn sync_inbox_window(&mut self) {
         let Some(inbox) = self
             .state
@@ -188,6 +195,10 @@ impl App {
         };
         if self.fences.contains_key(&inbox) == self.state.hidden_inbox().is_some() {
             self.resync_windows();
+            // While it had no window, another fence may have grown or moved over its spot.
+            if self.fences.contains_key(&inbox) {
+                self.move_out_of_overlap(inbox);
+            }
         }
     }
 
@@ -296,8 +307,8 @@ impl App {
     /// multiples of icons"): the width becomes whole icon columns and a fixed height whole rows.
     /// Interactive resizing snaps in WM_SIZING; this applies the same rule to the explicit
     /// changes of the cell size (icon size, spacing, layout, label lines). Other sizes still
-    /// show whole icons (the rows and columns share the rest), so loading, DPI changes, tabs
-    /// and switching the setting on keep the saved rectangle. Off, sizes are free.
+    /// show whole icons (the columns share the rest, the rows leave it empty), so loading, DPI
+    /// changes, tabs and switching the setting on keep the saved rectangle. Off, sizes are free.
     pub(super) fn apply_cell_snap(&mut self, id: FenceId) {
         let id = self.state.host_of(id);
         let Some(f) = self.state.fence(id).cloned() else {
@@ -311,7 +322,8 @@ impl App {
         let Some(steps) = self.grid_steps(id, scale) else {
             return;
         };
-        if !steps.cells {
+        // Collapsed to its left tab column, the window is as wide as the column.
+        if !steps.cells || w.collapsed_expanded_width_px().is_some() {
             return;
         }
         let mut width = r.right - r.left;
@@ -384,7 +396,20 @@ impl App {
         let Some(w) = self.fences.get(&id) else {
             return;
         };
-        let Some(mut h) = w.auto_height_px() else {
+        // A rolled fence follows its tabs: collapsed to the left tab column, or back to a title
+        // row at its expanded width.
+        if let Some(rect) = w.settle_rolled_size() {
+            let expanded = w.expanded_height_px();
+            self.record_bounds(id, rect, true, expanded);
+            self.schedule_save();
+        }
+        let Some(w) = self.fences.get(&id) else {
+            return;
+        };
+        // A fence without auto height still grows once to show a new left tab column (taken
+        // on every pass, so a request left by an auto-height fence does not fire later).
+        let rail = w.take_rail_growth_px();
+        let Some(mut h) = w.auto_height_px().or(rail) else {
             return;
         };
         let r = w.rect();
@@ -424,17 +449,15 @@ impl App {
                 let px = self.state.fence_px_rect(&fence);
                 // State, not the window: sync_fence_windows has just made the window agree, and
                 // a fence rolled in the old layout but expanded in the new one needs px.height().
-                let h = if fence.rolled_up {
-                    window::window_rect_size(w.hwnd()).1
-                } else {
-                    px.height()
-                };
-                w.set_bounds(RECT {
-                    left: px.left,
-                    top: px.top,
-                    right: px.right,
-                    bottom: px.top + h,
-                });
+                w.place_saved(
+                    RECT {
+                        left: px.left,
+                        top: px.top,
+                        right: px.right,
+                        bottom: px.bottom,
+                    },
+                    fence.rolled_up,
+                );
             }
         }
         // Fences new to these monitors (or whose monitor is gone) move out of the others' way;
@@ -498,17 +521,15 @@ impl App {
         for fence in self.state.host_fences() {
             if let Some(w) = self.fences.get(&fence.id) {
                 let px = self.state.fence_px_rect(&fence);
-                let h = if fence.rolled_up {
-                    window::window_rect_size(w.hwnd()).1
-                } else {
-                    px.height()
-                };
-                w.set_bounds(RECT {
-                    left: px.left,
-                    top: px.top,
-                    right: px.right,
-                    bottom: px.top + h,
-                });
+                w.place_saved(
+                    RECT {
+                        left: px.left,
+                        top: px.top,
+                        right: px.right,
+                        bottom: px.bottom,
+                    },
+                    fence.rolled_up,
+                );
             }
             self.apply_fence_view(fence.id);
         }
@@ -533,6 +554,8 @@ impl App {
         {
             w.set_icon_size(size);
         }
+        // The old size's extractions still queued would delay the new size's.
+        self.drop_unneeded_icon_requests();
         self.apply_cell_snap(fence);
         self.fit_height_to_content(fence);
         self.apply_auto_height(fence);
@@ -568,6 +591,7 @@ impl App {
                     .fence(fence)
                     .map(|f| f.title.clone())
                     .unwrap_or_default(),
+                w.rail_row_screen_rect(fence),
                 self.queue.clone(),
                 self.theme_mode,
             );
@@ -817,7 +841,7 @@ impl App {
 
     pub(super) fn overlaps_fence(&self, r: &RECT, gap: i32) -> bool {
         self.fences.values().any(|f| {
-            let o = f.rect();
+            let o = f.footprint_rect();
             r.left < o.right - gap / 2
                 && r.right > o.left + gap / 2
                 && r.top < o.bottom - gap / 2
@@ -852,7 +876,10 @@ impl App {
             bottom: top + h,
         };
         let mut candidates = Vec::new();
-        if let Some(src) = near.and_then(|id| self.fences.get(&id)).map(|f| f.rect()) {
+        if let Some(src) = near
+            .and_then(|id| self.fences.get(&id))
+            .map(|f| f.footprint_rect())
+        {
             candidates.push(at(src.right + gap, src.top));
             candidates.push(at(src.left - gap - w, src.top));
             candidates.push(at(src.left, src.bottom + gap));

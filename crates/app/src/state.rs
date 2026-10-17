@@ -1,7 +1,7 @@
 //! Application state: config + layout selection + desktop item catalog + rule routing.
 
 use pecofence_core::geometry::{self, PxRect, WorkArea};
-use pecofence_core::rules::{Cond, Decision, RuleSet, Target, Template};
+use pecofence_core::rules::{Cond, Decision, RuleSet, Target, Template, Unmatched};
 use pecofence_core::{
     AssignedBy, Config, ConfigStore, Fence, FenceId, FenceKind, IconKey, Item, ItemId, ItemKey,
     ItemRef, ItemSourceSpec, Layout, LoadOutcome, MonitorIdentity, Origin, SortMode,
@@ -25,6 +25,11 @@ pub struct AppState {
     portal_members: HashMap<FenceId, Vec<ItemId>>,
     /// Portal fence → subfolder it has navigated into (absent = its root folder).
     portal_cwd: HashMap<FenceId, PathBuf>,
+    /// Portals whose folder could not be found at the last read.
+    portal_missing: HashSet<FenceId>,
+    /// When the youngest `.tmp` the rules skipped as too new has lasted `TMP_SETTLE_SECS`
+    /// (Unix seconds): the App syncs the desktop again then (`take_tmp_settle_at`).
+    tmp_settle_at: std::cell::Cell<Option<i64>>,
     pub work_areas: Vec<WorkArea>,
     /// Fences with no spot saved on the current monitors (see [`Self::ensure_layout`]): they
     /// sit where their spot elsewhere puts them until the App moves them out of the others' way.
@@ -73,6 +78,23 @@ fn config_dir(portable: bool) -> PathBuf {
         .join("PecoFence")
 }
 
+/// `path` as the file system spells it (real casing, symlinks and junctions resolved), without
+/// the `\\?\` prefix canonicalize adds. A network share or a mapped drive comes back as
+/// `\\?\UNC\server\share\…`, which must turn into `\\server\share\…`, not a relative path.
+/// `path` itself when it cannot be resolved.
+pub fn canonical_path(path: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&path) {
+        Ok(real) => {
+            let s = real.to_string_lossy();
+            match s.strip_prefix(r"\\?\UNC\") {
+                Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+                None => PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)),
+            }
+        }
+        Err(_) => path,
+    }
+}
+
 /// Whether `path` really lives in the Store package's private copy of %APPDATA% (see
 /// `AppState::config_path_on_disk`).
 fn in_package_folder(path: &Path) -> bool {
@@ -114,6 +136,8 @@ impl AppState {
             portal_items: HashMap::new(),
             portal_members: HashMap::new(),
             portal_cwd: HashMap::new(),
+            portal_missing: HashSet::new(),
+            tmp_settle_at: std::cell::Cell::new(None),
             work_areas,
             unplaced: Vec::new(),
             first_run,
@@ -121,6 +145,18 @@ impl AppState {
             unreadable_moved_to,
         };
         state.rebuild_catalog();
+        if state.config.drop_duplicates() {
+            tracing::warn!("duplicate fences or memberships in the configuration dropped");
+            state.dirty = true;
+        }
+        if pecofence_core::config_store::clamp_sizes(&mut state.config) {
+            tracing::warn!("fence sizes out of range in the configuration clamped");
+            state.dirty = true;
+        }
+        if pecofence_core::config_store::repair_unc_portals(&mut state.config) {
+            tracing::info!("network portal paths saved by 0.2.1 repaired");
+            state.dirty = true;
+        }
         state.ensure_layout();
         state.normalize_tabs();
         state
@@ -134,17 +170,7 @@ impl AppState {
     /// land in its `LocalCache\Roaming`, so only this process sees the file at the %APPDATA%
     /// path; the final path of the opened file names the real one.
     pub fn config_path_on_disk(&self) -> PathBuf {
-        let path = self.config_path();
-        match std::fs::canonicalize(&path) {
-            Ok(real) => {
-                let s = real.to_string_lossy();
-                match s.strip_prefix(r"\\?\UNC\") {
-                    Some(unc) => PathBuf::from(format!(r"\\{unc}")),
-                    None => PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s)),
-                }
-            }
-            Err(_) => path,
-        }
+        canonical_path(self.config_path())
     }
 
     /// Where the configuration lives, as a fixed name for the log and feedback: the portable
@@ -184,18 +210,24 @@ impl AppState {
             config.items = std::mem::take(&mut self.config.items);
         }
         // Snapshots are local history, including the "…前" undo snapshot the caller just took:
-        // never let an import / backup file wipe them. Merge the file's by id, oldest first.
+        // never let an import / backup file wipe them. The file's own (by id) fill the free
+        // slots, newest first; the list stays oldest first.
         let mut snaps = std::mem::take(&mut self.config.snapshots);
-        for s in std::mem::take(&mut config.snapshots) {
-            if !snaps.iter().any(|x| x.id == s.id) {
-                snaps.push(s);
-            }
-        }
+        let mut incoming: Vec<_> = std::mem::take(&mut config.snapshots)
+            .into_iter()
+            .filter(|s| !snaps.iter().any(|x| x.id == s.id))
+            .collect();
+        incoming.sort_by_key(|s| std::cmp::Reverse(s.ts));
+        incoming.truncate(pecofence_core::MAX_SNAPSHOTS.saturating_sub(snaps.len()));
+        snaps.extend(incoming);
         snaps.sort_by_key(|s| s.ts);
         while snaps.len() > pecofence_core::MAX_SNAPSHOTS {
             snaps.remove(0);
         }
         config.snapshots = snaps;
+        config.drop_duplicates();
+        pecofence_core::config_store::clamp_sizes(&mut config);
+        pecofence_core::config_store::repair_unc_portals(&mut config);
         self.config = config;
         self.rebuild_catalog();
         self.layout = 0;
@@ -343,6 +375,8 @@ impl AppState {
                 let rest = rest.to_string();
                 let moved = format!("{new_prefix}{rest}");
                 item.key = ItemKey::Path(moved.clone());
+                // The next desktop sync brings the new spelling.
+                item.path = None;
                 if let IconKey::ByContent { path, .. } = &mut item.icon_key {
                     *path = moved;
                 }
@@ -401,7 +435,9 @@ impl AppState {
             base
         });
         let mut unplaced = if source == target {
-            Vec::new()
+            // Import / snapshot restore run this twice before the App settles them: keep the
+            // fences the first pass found no spot for.
+            std::mem::take(&mut self.unplaced)
         } else {
             self.config.carry_fences(source, target)
         };
@@ -641,8 +677,9 @@ impl AppState {
             .map(|f| f.id)
     }
 
-    /// The inbox while 为空时自动隐藏 keeps it without a window: the flag is on, it shows no
-    /// items, and it is a window of its own (a tab, or a host of tabs, stays).
+    /// The inbox while it is kept without a window: 为空时自动隐藏 is on and it shows no items,
+    /// or 显示 Windows 桌面图标时隐藏“桌面”栅栏 is on while the Windows icons show. Only a
+    /// window of its own hides (a tab, or a host of tabs, stays).
     pub fn hidden_inbox(&self) -> Option<FenceId> {
         let f = self.fences().iter().find(|f| f.kind == FenceKind::Inbox)?;
         let empty = !f.items.iter().any(|r| {
@@ -651,7 +688,11 @@ impl AppState {
                 .get(&r.item_id)
                 .is_some_and(|it| it.orphaned_since.is_none())
         });
-        (f.hide_when_empty && empty && f.tab_host.is_none() && self.tabs_of(f.id).len() <= 1)
+        let settings = &self.config.settings;
+        let for_windows_icons = settings.hide_inbox_when_icons_shown && !settings.hide_real_icons;
+        (((f.hide_when_empty && empty) || for_windows_icons)
+            && f.tab_host.is_none()
+            && self.tabs_of(f.id).len() <= 1)
             .then_some(f.id)
     }
 
@@ -663,14 +704,20 @@ impl AppState {
         self.dirty
     }
 
-    /// `IconCache::cache_key` of every item a fence can show (desktop records and the
-    /// portals' current folder contents).
-    pub fn icon_keys(&self) -> HashSet<String> {
-        self.config
-            .items
-            .values()
-            .chain(self.portal_items.values())
-            .map(|item| crate::icons::IconCache::cache_key(&item.icon_key))
+    /// Icons `host`'s window can switch to without waiting: the items of its tabs other than
+    /// `shown` (the window reports those itself), each with that tab's icon edge in pixels on
+    /// a monitor of `dpi`. Orphaned records show nowhere, so their icons are not wanted.
+    pub fn tab_icons(&self, host: FenceId, shown: FenceId, dpi: u32) -> Vec<(&IconKey, u32)> {
+        self.tabs_of(host)
+            .into_iter()
+            .filter(|&tab| tab != shown)
+            .filter_map(|tab| self.fence(tab))
+            .flat_map(|f| {
+                let px = crate::layout::icon_px(f.view.layout, f.view.icon_size, dpi);
+                self.items_of(f)
+                    .into_iter()
+                    .map(move |item| (&item.icon_key, px))
+            })
             .collect()
     }
 
@@ -709,7 +756,19 @@ impl AppState {
             return Decision::Default(Target::Inbox);
         }
         if self.config.rules.keep_updated {
-            self.config.rules.evaluate(&self.facts_for(entry))
+            let facts = self.facts_for(entry);
+            let decision = self.config.rules.evaluate(&facts);
+            if decision == Decision::Skip
+                && facts.file_name.to_lowercase().ends_with(".tmp")
+                && let Some(age) = facts.age_secs
+                && age < pecofence_core::rules::TMP_SETTLE_SECS
+            {
+                let at = pecofence_core::now_unix()
+                    + (pecofence_core::rules::TMP_SETTLE_SECS - age) as i64;
+                let soonest = self.tmp_settle_at.get().map_or(at, |t| t.min(at));
+                self.tmp_settle_at.set(Some(soonest));
+            }
+            decision
         } else {
             Decision::Default(Target::Inbox)
         }
@@ -796,16 +855,75 @@ impl AppState {
             is_hidden: false,
             is_system: false,
             idle_days: Self::idle_days(entry.mtime, last_opened, now),
+            age_secs: Self::age_secs(entry.created, entry.mtime, now),
         }
+    }
+
+    /// Seconds since the later of creation and last write; `None` when the file reports no
+    /// time at all.
+    fn age_secs(created: i64, mtime: i64, now: i64) -> Option<u64> {
+        let last = created.max(mtime);
+        (last > 0).then(|| (now - last).max(0) as u64)
+    }
+
+    /// When a `.tmp` skipped as too new will have lasted long enough to be routed (Unix
+    /// seconds), once; see `tmp_settle_at`.
+    pub fn take_tmp_settle_at(&self) -> Option<i64> {
+        self.tmp_settle_at.take()
     }
 
     /// Reconciles the item table with the current desktop contents. New items are routed by the
     /// rule set; missing items are marked orphaned (membership kept) and garbage-collected
     /// after seven days.
     pub fn sync_desktop(&mut self, entries: &[DesktopEntry]) -> SyncReport {
+        self.sync_desktop_partly_read(entries, &[])
+    }
+
+    /// [`Self::sync_desktop`] with a listing that could not read the `unread` desktop folders
+    /// in full: their items missing from it are not orphaned.
+    pub fn sync_desktop_partly_read(
+        &mut self,
+        entries: &[DesktopEntry],
+        unread: &[EntryOrigin],
+    ) -> SyncReport {
         let mut report = SyncReport::default();
         let now = pecofence_core::now_unix();
         let mut seen: HashSet<ItemId> = HashSet::new();
+        // One pass over the fences instead of a search per entry (quadratic on a crowded
+        // desktop).
+        let in_fence: HashSet<ItemId> = self
+            .fences()
+            .iter()
+            .flat_map(|f| f.items.iter().map(|r| r.item_id))
+            .collect();
+        // Naming new entries one at a time costs several ms each on a OneDrive desktop: a batch
+        // of them (first run, an unpacked archive) is named per folder in one go, as
+        // `refresh_portal` does.
+        let mut new_dirs: Vec<&Path> = Vec::new();
+        let mut new_count = 0usize;
+        for entry in entries {
+            if entry.origin == EntryOrigin::Namespace
+                || self
+                    .catalog
+                    .contains_key(&ItemKey::from_path(&entry.path.to_string_lossy()))
+            {
+                continue;
+            }
+            new_count += 1;
+            if let Some(d) = entry.path.parent()
+                && !new_dirs.contains(&d)
+            {
+                new_dirs.push(d);
+            }
+        }
+        let listed: HashMap<&Path, HashMap<String, String>> = if new_count > 2 {
+            new_dirs
+                .iter()
+                .map(|d| (*d, shell::display_names_in(d)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         for entry in entries {
             let key = ItemKey::from_path(&entry.path.to_string_lossy());
@@ -828,33 +946,56 @@ impl AppState {
                         item.size = entry.size;
                         changed = true;
                     }
+                    // A deleted file's record is reused by a folder of the same name (or the
+                    // other way round) while it is still catalogued.
+                    if item.is_folder != entry.is_folder {
+                        item.is_folder = entry.is_folder;
+                        changed = true;
+                    }
+                    // The key ignores case: a case-only rename (or a file from an older
+                    // version) brings the on-disk spelling here.
+                    let path = entry.path.to_string_lossy();
+                    if item.path.as_deref() != Some(&*path) {
+                        item.path = Some(path.into_owned());
+                        changed = true;
+                    }
                     if changed {
                         report.updated += 1;
                         self.dirty = true;
                     }
                 }
-                // An item that exists but is in no fence (e.g. its fence was deleted) → route.
-                if self.config.fence_of_item(self.layout, id).is_none() {
+                // An item that exists but is in no fence (e.g. its fence was deleted, or a .tmp
+                // skipped while fresh) → route. Counted, so the caller refreshes the windows.
+                if !in_fence.contains(&id) {
                     let decision = self.route_decision(entry);
-                    if let Some((fence, by)) = self.target_fence(decision) {
-                        self.config.assign(self.layout, id, fence, by);
+                    if let Some((fence, by)) = self.target_fence(decision)
+                        && self.config.assign(self.layout, id, fence, by).is_some()
+                    {
+                        report.updated += 1;
                         self.dirty = true;
                     }
                 }
                 continue;
             }
             // New item.
-            let display_name = shell::display_name(&entry.path).unwrap_or_else(|| {
-                let stem = Path::new(&entry.file_name)
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| entry.file_name.clone());
-                if entry.is_folder {
-                    entry.file_name.clone()
-                } else {
-                    stem
-                }
-            });
+            let display_name = entry
+                .path
+                .parent()
+                .and_then(|d| listed.get(d))
+                .and_then(|names| names.get(&entry.file_name.to_lowercase()))
+                .cloned()
+                .or_else(|| shell::display_name(&entry.path))
+                .unwrap_or_else(|| {
+                    let stem = Path::new(&entry.file_name)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| entry.file_name.clone());
+                    if entry.is_folder {
+                        entry.file_name.clone()
+                    } else {
+                        stem
+                    }
+                });
             let item = Item {
                 id: uuid::Uuid::new_v4(),
                 key: key.clone(),
@@ -873,6 +1014,7 @@ impl AppState {
                 size: entry.size,
                 open_count: 0,
                 last_opened: None,
+                path: Some(entry.path.to_string_lossy().into_owned()),
             };
             let id = item.id;
             self.config.items.insert(id, item);
@@ -887,9 +1029,17 @@ impl AppState {
         }
 
         // Orphans.
+        let unread: Vec<Origin> = unread
+            .iter()
+            .map(|o| match o {
+                EntryOrigin::UserDesktop => Origin::UserDesktop,
+                EntryOrigin::PublicDesktop => Origin::PublicDesktop,
+                EntryOrigin::Namespace => Origin::Namespace,
+            })
+            .collect();
         let mut to_remove = Vec::new();
         for (id, item) in self.config.items.iter_mut() {
-            if seen.contains(id) {
+            if seen.contains(id) || unread.contains(&item.origin) {
                 continue;
             }
             match item.orphaned_since {
@@ -903,15 +1053,36 @@ impl AppState {
             }
         }
         for id in to_remove {
-            if let Some(item) = self.config.items.remove(&id) {
-                self.catalog.remove(&item.key);
-            }
-            for f in &mut self.config.layouts[self.layout].fences {
-                f.items.retain(|r| r.item_id != id);
-            }
-            self.dirty = true;
+            self.remove_item_record(id);
         }
         report
+    }
+
+    /// Removes a desktop item's record from the table, the catalog and the fences.
+    fn remove_item_record(&mut self, id: ItemId) {
+        if let Some(item) = self.config.items.remove(&id) {
+            self.catalog.remove(&item.key);
+        }
+        for f in &mut self.config.layouts[self.layout].fences {
+            f.items.retain(|r| r.item_id != id);
+        }
+        self.dirty = true;
+    }
+
+    /// Before the user renames an item to `path`: a file of that name deleted less than seven
+    /// days ago still has its (orphaned) record, which would take the renamed file for the old
+    /// one at the next sync and move it into the old file's fence. Drop that record.
+    pub fn forget_orphan_at(&mut self, path: &Path) {
+        let key = ItemKey::from_path(&path.to_string_lossy());
+        if let Some(&id) = self.catalog.get(&key)
+            && self
+                .config
+                .items
+                .get(&id)
+                .is_some_and(|it| it.orphaned_since.is_some())
+        {
+            self.remove_item_record(id);
+        }
     }
 
     /// Live workspace entries, including the current contents of folder portals.
@@ -927,9 +1098,9 @@ impl AppState {
             .len()
     }
 
-    /// Items of `fence` in display order (orphans hidden).
-    pub fn items_of(&self, fence: &Fence) -> Vec<&Item> {
-        let mut items: Vec<(Option<&ItemRef>, &Item)> = if fence.kind == FenceKind::FolderPortal {
+    /// Items of `fence` with their refs, as stored (orphans hidden), before any sort.
+    fn fence_members<'s, 'f>(&'s self, fence: &'f Fence) -> Vec<(Option<&'f ItemRef>, &'s Item)> {
+        if fence.kind == FenceKind::FolderPortal {
             self.portal_members
                 .get(&fence.id)
                 .map(|ids| {
@@ -945,7 +1116,18 @@ impl AppState {
                 .filter_map(|r| self.config.items.get(&r.item_id).map(|it| (Some(r), it)))
                 .filter(|(_, it)| it.orphaned_since.is_none())
                 .collect()
-        };
+        }
+    }
+
+    /// Items of `fence` in no particular order (orphans hidden): for callers that only need
+    /// the set, without the sort `items_of` pays for.
+    pub fn unsorted_items_of<'s>(&'s self, fence: &Fence) -> impl Iterator<Item = &'s Item> {
+        self.fence_members(fence).into_iter().map(|(_, it)| it)
+    }
+
+    /// Items of `fence` in display order (orphans hidden).
+    pub fn items_of(&self, fence: &Fence) -> Vec<&Item> {
+        let mut items = self.fence_members(fence);
         match fence.view.sort {
             SortMode::Manual => items.sort_by_key(|(r, it)| {
                 (
@@ -1035,6 +1217,11 @@ impl AppState {
         self.portal_cwd.contains_key(&id)
     }
 
+    /// True when the portal's folder could not be found at the last read.
+    pub fn portal_missing(&self, id: FenceId) -> bool {
+        self.portal_missing.contains(&id)
+    }
+
     /// Navigates a portal into `dir` (must be inside its root). Returns false if refused.
     pub fn portal_enter(&mut self, id: FenceId, dir: &Path) -> bool {
         let Some(root) = self.portal_root(id) else {
@@ -1084,12 +1271,14 @@ impl AppState {
         }
     }
 
-    /// The portal (if any) whose current folder contains this runtime item.
+    /// The portal (if any) whose current folder contains this runtime item: the first in layout
+    /// order when two portals show the same folder.
     pub fn portal_of_item(&self, item: ItemId) -> Option<FenceId> {
-        self.portal_members
-            .iter()
-            .find(|(_, ids)| ids.contains(&item))
-            .map(|(f, _)| *f)
+        self.fences().iter().map(|f| f.id).find(|f| {
+            self.portal_members
+                .get(f)
+                .is_some_and(|ids| ids.contains(&item))
+        })
     }
 
     pub fn set_portal_navigate(&mut self, id: FenceId, on: bool) {
@@ -1149,10 +1338,10 @@ impl AppState {
     /// other portal references leave `portal_items`. Returns the old items for diffing.
     fn evict_portal_members(&mut self, id: FenceId) -> Vec<Item> {
         let old_ids = self.portal_members.remove(&id).unwrap_or_default();
+        let shared: HashSet<ItemId> = self.portal_members.values().flatten().copied().collect();
         let mut old = Vec::with_capacity(old_ids.len());
         for i in &old_ids {
-            let shared = self.portal_members.values().any(|v| v.contains(i));
-            let item = if shared {
+            let item = if shared.contains(i) {
                 self.portal_items.get(i).cloned()
             } else {
                 self.portal_items.remove(i)
@@ -1175,6 +1364,7 @@ impl AppState {
             return false;
         };
         let started = std::time::Instant::now();
+        let was_missing = self.portal_missing.contains(&id);
         let old_items = self.evict_portal_members(id);
         // Display names survive a re-read: asking the shell costs several ms per item on a
         // OneDrive folder, and an unchanged file (same path, same mtime) has the same name.
@@ -1191,6 +1381,14 @@ impl AppState {
                 .cloned()
         };
         let entries = shell::enumerate_folder(&dir);
+        // A folder that is gone lists as empty; the fence must say which of the two it is. Only
+        // an empty listing asks (one more round trip on an unreachable share otherwise).
+        let missing = entries.is_empty() && !dir.is_dir();
+        if missing {
+            self.portal_missing.insert(id);
+        } else {
+            self.portal_missing.remove(&id);
+        }
         let unnamed = entries
             .iter()
             .filter(|e| known_name(&ItemKey::from_path(&e.path.to_string_lossy()), e).is_none())
@@ -1237,12 +1435,13 @@ impl AppState {
                 size: entry.size,
                 open_count: 0,
                 last_opened: None,
+                path: Some(path_str),
             };
             new_items.push(item.clone());
             self.portal_items.insert(item_id, item);
             ids.push(item_id);
         }
-        let changed = old_items != new_items;
+        let changed = old_items != new_items || missing != was_missing;
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         if changed {
             tracing::info!(%id, folder = %dir.display(), count = ids.len(), ms, "portal refreshed");
@@ -1273,6 +1472,7 @@ impl AppState {
         for id in stale {
             self.evict_portal_members(id);
             self.portal_cwd.remove(&id);
+            self.portal_missing.remove(&id);
         }
         portals
             .into_iter()
@@ -1286,16 +1486,30 @@ impl AppState {
             .copied()
     }
 
+    /// The item at `path` if its file is on the desktop right now (a deleted file's record,
+    /// kept for a while, does not count).
+    pub fn live_item_by_path(&self, path: &Path) -> Option<ItemId> {
+        let id = self.item_by_path(path)?;
+        self.config
+            .items
+            .get(&id)
+            .is_some_and(|it| it.orphaned_since.is_none())
+            .then_some(id)
+    }
+
     /// Re-keys an item after a rename so it stays in its fence. Returns false if unknown.
     pub fn rename_item(&mut self, old: &Path, new: &Path) -> bool {
         let old_key = ItemKey::from_path(&old.to_string_lossy());
         let new_key = ItemKey::from_path(&new.to_string_lossy());
         // Safe-save (Word, Excel): the document is renamed to a temporary name and a fresh copy
         // is renamed over its name. The item already on the new key (the document's) is kept;
-        // the sync finds the file again.
-        let to_temp = new
-            .file_name()
-            .is_some_and(|n| pecofence_core::rules::is_temporary(&n.to_string_lossy()));
+        // the sync finds the file again. AutoCAD does the same with `.bak` as the temporary
+        // name (abcd.dwg → abcd.bak, then sav*.tmp → abcd.dwg).
+        let to_temp = new.file_name().is_some_and(|n| {
+            let n = n.to_string_lossy();
+            pecofence_core::rules::is_temporary(&n, None)
+                || pecofence_core::rules::ext_of(&n) == ".bak"
+        });
         if to_temp || (new_key != old_key && self.catalog.contains_key(&new_key)) {
             return false;
         }
@@ -1309,6 +1523,7 @@ impl AppState {
             .map(|m| m.is_dir())
             .unwrap_or(item.is_folder);
         item.key = new_key.clone();
+        item.path = Some(new.to_string_lossy().into_owned());
         item.is_folder = is_folder;
         item.display_name = shell::display_name(new).unwrap_or_else(|| {
             new.file_stem()
@@ -1429,7 +1644,8 @@ impl AppState {
 
     /// What [`apply_rules_all`](Self::apply_rules_all) would do, without doing it: one entry per
     /// item that is not pinned by a manual placement and whose rule target differs from the
-    /// fence it is in now (`idle_only`: see [`apply_idle_rules`](Self::apply_idle_rules)).
+    /// fence it is in now (`idle_only`: see [`apply_idle_rules`](Self::apply_idle_rules)). With
+    /// [`Unmatched::Stay`] an item in a fence that no rule matches stays there.
     pub fn plan_rules(&self, entries: &[DesktopEntry], idle_only: bool) -> Vec<PlannedRuleMove> {
         let mut plan = Vec::new();
         for entry in entries {
@@ -1463,6 +1679,12 @@ impl AppState {
                     continue;
                 }
             }
+            if current.is_some()
+                && matches!(decision, Decision::Default(_))
+                && self.config.rules.unmatched == Unmatched::Stay
+            {
+                continue;
+            }
             let Some((to, by)) = self.target_fence(decision) else {
                 continue;
             };
@@ -1478,45 +1700,6 @@ impl AppState {
             });
         }
         plan
-    }
-
-    /// Re-files `ids` by the rules as if they had just arrived on the desktop (the user dragged
-    /// them out of a fence onto the desktop: an explicit "let go", so an earlier manual
-    /// placement no longer pins them). Unmatched items stay where they are (the inbox).
-    /// Returns the fences whose membership changed.
-    pub fn apply_rules_to(&mut self, ids: &[ItemId], entries: &[DesktopEntry]) -> Vec<FenceId> {
-        let mut touched = Vec::new();
-        for entry in entries {
-            if entry.origin == EntryOrigin::Namespace {
-                continue;
-            }
-            let key = ItemKey::from_path(&entry.path.to_string_lossy());
-            let Some(&id) = self.catalog.get(&key) else {
-                continue;
-            };
-            if !ids.contains(&id) {
-                continue;
-            }
-            let from = self
-                .fences()
-                .iter()
-                .find(|f| f.contains_item(id))
-                .map(|f| f.id);
-            let decision = self.config.rules.evaluate(&self.facts_for(entry));
-            if let Some((fence, by)) = self.target_fence(decision)
-                && Some(fence) != from
-                && self.config.assign(self.layout, id, fence, by).is_some()
-            {
-                touched.extend(from);
-                touched.push(fence);
-            }
-        }
-        if !touched.is_empty() {
-            self.dirty = true;
-            touched.sort_unstable();
-            touched.dedup();
-        }
-        touched
     }
 
     // ---- fences -----------------------------------------------------------------------------
@@ -1885,6 +2068,7 @@ impl AppState {
         };
         let removed = self.config.layouts[self.layout].fences.remove(pos);
         self.portal_cwd.remove(&id);
+        self.portal_missing.remove(&id);
         self.evict_portal_members(id);
         let ids: Vec<ItemId> = removed.items.iter().map(|r| r.item_id).collect();
         for item in ids {
@@ -2024,6 +2208,8 @@ mod tests {
             portal_items: HashMap::new(),
             portal_members: HashMap::new(),
             portal_cwd: HashMap::new(),
+            portal_missing: HashSet::new(),
+            tmp_settle_at: std::cell::Cell::new(None),
             work_areas,
             unplaced: Vec::new(),
             first_run: true,
@@ -2041,6 +2227,60 @@ mod tests {
             right: left + w,
             bottom: top + h,
         }
+    }
+
+    #[test]
+    fn an_imported_file_never_pushes_local_snapshots_out() {
+        let snap = |name: String, ts: i64| pecofence_core::Snapshot {
+            id: uuid::Uuid::new_v4(),
+            name,
+            ts,
+            layouts: Vec::new(),
+        };
+        let mut state = test_state();
+        state.config.snapshots = vec![snap("home".into(), 1), snap("work".into(), 2)];
+        let local: Vec<uuid::Uuid> = state.config.snapshots.iter().map(|s| s.id).collect();
+        let mut file = state.config.clone();
+        file.snapshots = (0..pecofence_core::MAX_SNAPSHOTS)
+            .map(|i| snap(format!("file {i}"), 100 + i as i64))
+            .collect();
+        let newest = file.snapshots.last().unwrap().id;
+        state.replace_config(file);
+        let kept = &state.config.snapshots;
+        assert_eq!(kept.len(), pecofence_core::MAX_SNAPSHOTS);
+        assert!(local.iter().all(|id| kept.iter().any(|s| s.id == *id)));
+        assert!(kept.iter().any(|s| s.id == newest));
+        assert!(kept.windows(2).all(|w| w[0].ts <= w[1].ts));
+    }
+
+    /// An import saved at another resolution: relayout_from_state runs ensure_layout again,
+    /// and the fences with no spot here must still be moved apart after that.
+    #[test]
+    fn an_imported_layout_keeps_its_fences_to_place() {
+        let id = "GSM7787#5&2C948443&0&UID24832";
+        let mut state = state_on(vec![monitor(id, 0, 3840, 2064, 192)]);
+        let mut file = state.config.clone();
+        file.layouts[0].fingerprint[0].screen_px = [1920, 1080];
+        file.layouts[0].fingerprint[0].dpi = 96;
+        state.replace_config(file);
+        let n = state.fences().len();
+        assert!(n > 0);
+        assert_eq!(state.unplaced.len(), n);
+        state.ensure_layout();
+        assert_eq!(state.unplaced.len(), n);
+    }
+
+    #[test]
+    fn an_imported_file_shows_a_fence_listed_twice_once() {
+        let mut state = test_state();
+        let mut file = state.config.clone();
+        let mut copy = file.layouts[0].fences[0].clone();
+        copy.title = "Dup".into();
+        file.layouts[0].fences.push(copy);
+        let fences = file.layouts[0].fences.len();
+        state.replace_config(file);
+        assert_eq!(state.fences().len(), fences - 1);
+        assert!(state.fences().iter().all(|f| f.title != "Dup"));
     }
 
     /// Issue #24: unplugging the big monitor, working on the laptop, plugging it back in.
@@ -2222,6 +2462,7 @@ mod tests {
             size: 0,
             open_count: 0,
             last_opened: None,
+            path: None,
         };
         let id = item.id;
         state.catalog.insert(item.key.clone(), id);
@@ -2272,6 +2513,47 @@ mod tests {
         assert_eq!(state.fences(), before.as_slice());
     }
 
+    /// A window keeps the icons of its other tabs at each tab's own size on its DPI; the tab
+    /// it shows reports its items itself, and orphaned records are not shown anywhere.
+    #[test]
+    fn tab_icons_cover_the_other_tabs_at_their_own_size() {
+        let mut state = test_state();
+        let (a, b, c) = (
+            state.fences()[0].id,
+            state.fences()[1].id,
+            state.fences()[2].id,
+        );
+        let d = state
+            .new_fence("Elsewhere", rect(600, 600, 300, 200))
+            .unwrap();
+        let keyed = |state: &mut AppState, fence, name: &str| {
+            let id = add_item(state, fence, name);
+            let key = IconKey::ByContent {
+                path: format!("c:/pics/{name}.jpg"),
+                mtime: 1,
+            };
+            state.config.items.get_mut(&id).unwrap().icon_key = key.clone();
+            (id, key)
+        };
+        keyed(&mut state, a, "shown");
+        let (_, big) = keyed(&mut state, b, "big");
+        let (_, row) = keyed(&mut state, c, "row");
+        let (gone, _) = keyed(&mut state, c, "gone");
+        keyed(&mut state, d, "elsewhere");
+        state.config.items.get_mut(&gone).unwrap().orphaned_since = Some(1);
+        state.fence_mut(b).unwrap().view.icon_size = 96;
+        state.fence_mut(c).unwrap().view.layout = pecofence_core::ViewLayout::Details;
+        state.attach_tab(b, a);
+        state.attach_tab(c, a);
+        let mut got = state.tab_icons(a, a, 144);
+        got.sort_by_key(|(_, px)| *px);
+        assert_eq!(got, vec![(&row, 30), (&big, 144)]);
+        // Showing another tab: the host's items join, at the host's own size.
+        let got = state.tab_icons(a, b, 96);
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().all(|(k, _)| *k != &big));
+    }
+
     #[test]
     fn workspace_count_includes_portals_deduplicates_paths_and_excludes_orphans() {
         let mut state = test_state();
@@ -2318,6 +2600,23 @@ mod tests {
     }
 
     #[test]
+    fn portal_reports_a_missing_folder_and_recovers() {
+        let root = std::env::temp_dir().join(format!("pecofence-portal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut state = test_state();
+        let fence = state.new_portal_fence(&root, RECT::default()).unwrap();
+        assert!(!state.portal_missing(fence));
+        // Nothing to list before or after: only the missing flag can make this a change.
+        std::fs::remove_dir(&root).unwrap();
+        assert!(state.refresh_portal(fence));
+        assert!(state.portal_missing(fence));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(state.refresh_portal(fence));
+        assert!(!state.portal_missing(fence));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reorder_items_places_before_display_index() {
         let mut state = test_state();
         let fence = state.fences()[0].id;
@@ -2360,6 +2659,46 @@ mod tests {
         }
     }
 
+    /// Feedback #25: `ABC.zip` was opened and listed as `abc.zip`.
+    #[test]
+    fn items_keep_the_on_disk_spelling_and_match_any_case() {
+        let mut state = test_state();
+        let fence = state.fences()[0].id;
+        // An item saved by an older version has only the folded key, until the sync.
+        let old = add_item(&mut state, fence, "readme");
+        assert_eq!(
+            state.item(old).unwrap().path(),
+            Some(r"c:\users\me\desktop\readme.txt")
+        );
+        state.sync_desktop(&[desktop_entry("README.txt"), desktop_entry("ABC.zip")]);
+        assert_eq!(
+            state.item(old).unwrap().path(),
+            Some("C:/Users/Me/Desktop/README.txt")
+        );
+        let id = state
+            .item_by_path(Path::new(r"c:\users\me\desktop\abc.ZIP"))
+            .unwrap();
+        assert_eq!(
+            state.item(id).unwrap().path(),
+            Some("C:/Users/Me/Desktop/ABC.zip")
+        );
+        // A case-only rename keeps the item and hands out the new spelling.
+        let report = state.sync_desktop(&[desktop_entry("README.txt"), desktop_entry("Abc.zip")]);
+        assert_eq!((report.added, report.removed, report.updated), (0, 0, 1));
+        assert_eq!(
+            state.item(id).unwrap().path(),
+            Some("C:/Users/Me/Desktop/Abc.zip")
+        );
+        assert!(state.rename_item(
+            Path::new("C:/Users/Me/Desktop/Abc.zip"),
+            Path::new("C:/Users/Me/Desktop/aBC.zip")
+        ));
+        assert_eq!(
+            state.item(id).unwrap().path(),
+            Some("C:/Users/Me/Desktop/aBC.zip")
+        );
+    }
+
     #[test]
     fn safe_save_keeps_the_document_in_its_fence() {
         let desk = |name: &str| PathBuf::from(format!("C:/Users/Me/Desktop/{name}"));
@@ -2389,6 +2728,190 @@ mod tests {
         assert_eq!(state.item_id_for_path(&desk("report.txt")), Some(doc));
         assert_eq!(state.config.fence_of_item(0, doc), Some(work));
         assert!(state.config.items[&copy].orphaned_since.is_some());
+        // A sync that catches the fresh copy mid-save puts it in no fence. Once the file has
+        // lasted a minute, the next sync (nothing else changed) puts it in a fence and reports
+        // that, so housekeeping refreshes the windows.
+        let mut fresh = desktop_entry("~WRD0002.tmp");
+        fresh.created = pecofence_core::now_unix();
+        state.sync_desktop(&[desktop_entry("report.txt"), fresh.clone()]);
+        let tmp = state.item_id_for_path(&desk("~WRD0002.tmp")).unwrap();
+        assert!(state.fences().iter().all(|f| !f.contains_item(tmp)));
+        fresh.created -= pecofence_core::rules::TMP_SETTLE_SECS as i64;
+        let report = state.sync_desktop(&[desktop_entry("report.txt"), fresh]);
+        assert!(report.changed(), "a routed .tmp must show up in the report");
+        assert_eq!(state.config.fence_of_item(0, tmp), Some(inbox));
+        // A .tmp that has been around for a while, or a .bak, shows like any other file.
+        state.sync_desktop(&[
+            desktop_entry("report.txt"),
+            desktop_entry("leftover.tmp"),
+            desktop_entry("notes.bak"),
+        ]);
+        for name in ["leftover.tmp", "notes.bak"] {
+            let id = state.item_id_for_path(&desk(name)).unwrap();
+            assert!(
+                state.config.fence_of_item(0, id).is_some(),
+                "{name} shows nowhere"
+            );
+        }
+        // AutoCAD: the drawing is renamed to .bak and the new copy (catalogued by a sync while
+        // it was written) is renamed over its name. The drawing keeps its record and fence; the
+        // .bak is a file like any other.
+        let mut sav = desktop_entry("sav1.tmp");
+        sav.created = pecofence_core::now_unix();
+        state.sync_desktop(&[desktop_entry("report.txt"), sav]);
+        assert!(!state.rename_item(&desk("report.txt"), &desk("report.bak")));
+        assert!(!state.rename_item(&desk("sav1.tmp"), &desk("report.txt")));
+        state.sync_desktop(&[desktop_entry("report.txt"), desktop_entry("report.bak")]);
+        assert_eq!(state.item_id_for_path(&desk("report.txt")), Some(doc));
+        assert_eq!(state.config.fence_of_item(0, doc), Some(work));
+        let bak = state.item_id_for_path(&desk("report.bak")).unwrap();
+        assert_eq!(state.config.fence_of_item(0, bak), Some(inbox));
+    }
+
+    /// #69 / #71: the shortcut rule is disabled and type rules plus a final 「普通文件」 rule are
+    /// applied. With 「留在当前栅栏」 the programs and shortcuts stay where that rule put them;
+    /// with the default they fall back to 「桌面」 as before. A new item still goes to 「桌面」.
+    #[test]
+    fn unmatched_items_can_stay_in_their_fence_when_the_rules_are_applied() {
+        use pecofence_core::rules::{Rule, TypeCategory};
+        let mut state = test_state();
+        let (programs, folders, docs) = (
+            state.fences()[0].id,
+            state.fences()[1].id,
+            state.fences()[2].id,
+        );
+        let inbox = state.inbox_id().unwrap();
+        let [archives, images, other] =
+            ["压缩", "图片", "其它"].map(|t| state.new_fence(t, rect(0, 0, 300, 200)).unwrap());
+        let mut folder = desktop_entry("Projects");
+        folder.is_folder = true;
+        let mut entries: Vec<DesktopEntry> = [
+            "Notepad.lnk",
+            "tool.exe",
+            "site.url",
+            "backup.zip",
+            "report.docx",
+            "table.tsv",
+            "photo.png",
+            "query.sql",
+            "page.html",
+            "data.qwe",
+        ]
+        .map(desktop_entry)
+        .into();
+        entries.push(folder);
+        // The first-run rules put the programs and shortcuts into 程序.
+        state.sync_desktop(&entries);
+        let id = |state: &AppState, name: &str| {
+            state
+                .item_id_for_path(Path::new(&format!("C:/Users/Me/Desktop/{name}")))
+                .unwrap()
+        };
+        let fence_of =
+            |state: &AppState, name: &str| state.config.fence_of_item(0, id(state, name));
+        assert_eq!(fence_of(&state, "Notepad.lnk"), Some(programs));
+        assert_eq!(fence_of(&state, "query.sql"), Some(inbox));
+        let type_rule = |cat, to| Rule::new("t", Target::Fence(to), vec![Cond::Type(vec![cat])]);
+        let rules = &mut state.config.rules;
+        rules.list[0].enabled = false;
+        rules.list.truncate(1);
+        rules.list.extend([
+            type_rule(TypeCategory::Archives, archives),
+            type_rule(TypeCategory::Folders, folders),
+            type_rule(TypeCategory::Documents, docs),
+            type_rule(TypeCategory::Images, images),
+            Rule::new("其它", Target::Fence(other), vec![Cond::PlainFiles]),
+        ]);
+        let shortcuts = ["Notepad.lnk", "tool.exe", "site.url"];
+        let plan = state.plan_rules(&entries, false);
+        for name in shortcuts {
+            let m = plan.iter().find(|m| m.item == id(&state, name)).unwrap();
+            assert_eq!((m.from, m.to), (Some(programs), inbox), "{name}");
+        }
+        state.config.rules.unmatched = Unmatched::Stay;
+        let plan = state.plan_rules(&entries, false);
+        assert!(
+            plan.iter()
+                .all(|m| shortcuts.iter().all(|n| m.item != id(&state, n)))
+        );
+        assert_eq!(state.apply_rules_all(&entries), plan.len());
+        for (name, fence) in [
+            ("Notepad.lnk", programs),
+            ("tool.exe", programs),
+            ("site.url", programs),
+            ("backup.zip", archives),
+            ("report.docx", docs),
+            ("table.tsv", docs),
+            ("photo.png", images),
+            ("query.sql", other),
+            ("page.html", other),
+            ("data.qwe", other),
+            ("Projects", folders),
+        ] {
+            assert_eq!(fence_of(&state, name), Some(fence), "{name}");
+        }
+        entries.push(desktop_entry("New.lnk"));
+        state.sync_desktop(&entries);
+        assert_eq!(fence_of(&state, "New.lnk"), Some(inbox));
+        assert!(state.plan_rules(&entries, false).is_empty());
+    }
+
+    /// b.txt deleted, then a.txt renamed to b.txt within the week: the deleted file's record
+    /// must not claim the renamed file and pull it into the old file's fence.
+    #[test]
+    fn a_rename_over_a_recently_deleted_name_keeps_the_item_in_its_fence() {
+        let desk = |name: &str| PathBuf::from(format!("C:/Users/Me/Desktop/{name}"));
+        let mut state = test_state();
+        let (inbox, work) = (state.inbox_id().unwrap(), state.fences()[1].id);
+        let gone = add_item(&mut state, inbox, "b");
+        state.config.items.get_mut(&gone).unwrap().orphaned_since = Some(1);
+        let kept = add_item(&mut state, work, "a");
+        state.forget_orphan_at(&desk("b.txt"));
+        assert!(state.rename_item(&desk("a.txt"), &desk("b.txt")));
+        state.sync_desktop(&[desktop_entry("b.txt")]);
+        assert_eq!(state.item_id_for_path(&desk("b.txt")), Some(kept));
+        assert_eq!(state.config.fence_of_item(0, kept), Some(work));
+        assert!(!state.config.items.contains_key(&gone));
+        assert!(state.fences().iter().all(|f| !f.contains_item(gone)));
+        // A live file of that name keeps its record; the rename is refused as before.
+        let live = add_item(&mut state, inbox, "c");
+        state.forget_orphan_at(&desk("c.txt"));
+        assert!(!state.rename_item(&desk("b.txt"), &desk("c.txt")));
+        assert_eq!(state.item_id_for_path(&desk("c.txt")), Some(live));
+    }
+
+    /// The public desktop could not be read: its files stay, the user's deleted one goes.
+    #[test]
+    fn a_desktop_folder_that_could_not_be_read_orphans_nothing() {
+        let mut state = test_state();
+        let mut public = desktop_entry("shared.txt");
+        public.path = PathBuf::from("C:/Users/Public/Desktop/shared.txt");
+        public.origin = EntryOrigin::PublicDesktop;
+        state.sync_desktop(&[desktop_entry("mine.txt"), public.clone()]);
+        let shared = state.item_id_for_path(&public.path).unwrap();
+        let mine = state
+            .item_id_for_path(Path::new("C:/Users/Me/Desktop/mine.txt"))
+            .unwrap();
+        let report = state.sync_desktop_partly_read(&[], &[EntryOrigin::PublicDesktop]);
+        assert_eq!(report.removed, 1);
+        assert!(state.config.items[&shared].orphaned_since.is_none());
+        assert!(state.config.items[&mine].orphaned_since.is_some());
+    }
+
+    #[test]
+    fn a_record_reused_by_a_folder_of_the_same_name_becomes_a_folder() {
+        let path = PathBuf::from("C:/Users/Me/Desktop/proj");
+        let mut state = test_state();
+        state.sync_desktop(&[desktop_entry("proj")]);
+        let id = state.item_id_for_path(&path).unwrap();
+        assert!(!state.config.items[&id].is_folder);
+        // Deleted, then a folder of that name within the week: the record is reused.
+        state.sync_desktop(&[]);
+        let mut folder = desktop_entry("proj");
+        folder.is_folder = true;
+        state.sync_desktop(&[folder]);
+        assert_eq!(state.item_id_for_path(&path), Some(id));
+        assert!(state.config.items[&id].is_folder);
     }
 
     /// Issue #39: the inbox cannot be deleted, but 为空时自动隐藏 keeps an empty one out of sight.
@@ -2413,6 +2936,28 @@ mod tests {
         state.detach_tab(other);
         assert_eq!(state.hidden_inbox(), Some(inbox));
         state.set_hide_when_empty(inbox, false);
+        assert_eq!(state.hidden_inbox(), None);
+    }
+
+    /// Feedback #4 and #21: with the Windows icons shown, the inbox can stay out of sight even
+    /// while it holds items; hiding the Windows icons again brings it back.
+    #[test]
+    fn the_inbox_hides_while_the_windows_icons_show_when_asked() {
+        let mut state = test_state();
+        let inbox = state.inbox_id().unwrap();
+        let other = state.fences().iter().find(|f| f.id != inbox).unwrap().id;
+        add_item(&mut state, inbox, "new");
+        state.config.settings.hide_inbox_when_icons_shown = true;
+        assert!(state.config.settings.hide_real_icons);
+        assert_eq!(state.hidden_inbox(), None, "the Windows icons are hidden");
+        state.config.settings.hide_real_icons = false;
+        assert_eq!(state.hidden_inbox(), Some(inbox));
+        // As a tab, or with tabs of its own, it is part of a window that stays.
+        state.attach_tab(other, inbox);
+        assert_eq!(state.hidden_inbox(), None);
+        state.detach_tab(other);
+        assert_eq!(state.hidden_inbox(), Some(inbox));
+        state.config.settings.hide_inbox_when_icons_shown = false;
         assert_eq!(state.hidden_inbox(), None);
     }
 

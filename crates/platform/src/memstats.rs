@@ -36,8 +36,14 @@ impl MemoryStats {
             )
             .ok()?;
         }
+        // Windows 10 before its September 2023 update leaves PrivateWorkingSetSize at 0.
+        let private_working_set = if counters.PrivateWorkingSetSize == 0 {
+            private_pages_in_working_set().unwrap_or(0)
+        } else {
+            counters.PrivateWorkingSetSize
+        };
         Ok(Self {
-            private_working_set: counters.PrivateWorkingSetSize,
+            private_working_set,
             working_set: counters.WorkingSetSize,
             peak_working_set: counters.PeakWorkingSetSize,
             private_commit: counters.PrivateUsage,
@@ -61,11 +67,42 @@ impl MemoryStats {
 
 /// Hands this process's working set back to Windows. The pages stay in memory on the standby
 /// list and return on their next touch, so only what is used again comes back: memory that
-/// only startup needed stops counting in Task Manager.
+/// only startup or an earlier interaction needed stops counting in Task Manager.
 pub fn trim_working_set() {
     windows_core::link!("kernel32.dll" "system" fn K32EmptyWorkingSet(process: HANDLE) -> windows_core::BOOL);
     // SAFETY: the pseudo handle of this process.
     unsafe {
         let _ = K32EmptyWorkingSet(GetCurrentProcess());
     }
+}
+
+/// The private working set counted page by page (`QueryWorkingSet`): the resident pages no
+/// other process shares, 4 KB each.
+fn private_pages_in_working_set() -> Option<usize> {
+    const SHARED_BIT: usize = 1 << 8;
+    const ERROR_BAD_LENGTH: u32 = 24;
+    // Entry 0 is the number of entries, then one PSAPI_WORKING_SET_BLOCK per page.
+    let mut buf: Vec<usize> = vec![0; 1 + 16 * 1024];
+    for _ in 0..4 {
+        // SAFETY: `buf` is writable for the byte length passed.
+        let ok = unsafe {
+            QueryWorkingSet(
+                GetCurrentProcess(),
+                buf.as_mut_ptr().cast(),
+                (buf.len() * size_of::<usize>()) as u32,
+            )
+        };
+        if ok.as_bool() {
+            let n = buf[0].min(buf.len() - 1);
+            let private = buf[1..=n].iter().filter(|e| *e & SHARED_BIT == 0).count();
+            return Some(private * 4096);
+        }
+        // SAFETY: plain FFI call.
+        if unsafe { GetLastError() } != ERROR_BAD_LENGTH {
+            return None;
+        }
+        // Too small: entry 0 says how many pages there are now.
+        buf = vec![0; buf[0].max(buf.len()) + 4096];
+    }
+    None
 }

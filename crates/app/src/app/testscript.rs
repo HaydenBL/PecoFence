@@ -29,7 +29,9 @@
 //! merge <title> <into-title> merge a fence into another one's tab strip
 //! delete <title>
 //! menu-delete <title>        the fence menu's 删除栅栏 (the same path, including its prompt)
-//! new-fence <x> <y> <w> <h>  physical px
+//! new-fence <x> <y> <w> <h>  open the 「在此新建栅栏」 menu for that rectangle (physical px), as
+//!                            a desktop marquee over no fence does; the script waits until
+//!                            the menu is closed
 //! drop-desktop <title>       first item of the fence dropped on the bare desktop (inbox + rules)
 //! move <title> <into-title>  first item of the fence moved into another fence (drop minus OLE)
 //! transfer <path> <title>    shell-move a file into the portal fence's folder (worker thread)
@@ -374,7 +376,7 @@ impl App {
                             self.queue.push(Command::MergeFence {
                                 fence: a,
                                 into: w.hwnd(),
-                                x: i32::MIN,
+                                at: (i32::MIN, i32::MIN),
                             });
                         }
                     }
@@ -432,7 +434,7 @@ impl App {
                 }
                 ["drop-desktop", title] => {
                     // What a drag-out onto the bare desktop ends in (minus the OLE round
-                    // trip): the fence's first item goes back to the inbox and through the rules.
+                    // trip): the fence's first item goes back to the inbox.
                     if let Some(id) = self.test_fence(title)
                         && let Some(item) = self
                             .state

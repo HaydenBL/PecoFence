@@ -18,6 +18,9 @@ pub enum Target {
 pub struct RuleSet {
     pub default_target: Target,
     pub keep_updated: bool,
+    /// Where applying the rules puts an item already in a fence that no rule matches.
+    #[serde(default)]
+    pub unmatched: Unmatched,
     /// Ordered; the first matching rule wins (after class ordering).
     pub list: Vec<Rule>,
 }
@@ -27,9 +30,23 @@ impl Default for RuleSet {
         Self {
             default_target: Target::Inbox,
             keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
             list: Vec::new(),
         }
     }
+}
+
+/// What applying the rules does with an item no rule matches. A new item, in no fence yet,
+/// always goes to the default target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum Unmatched {
+    /// Back to the default target (the 「桌面」 fence).
+    #[default]
+    DefaultTarget,
+    /// It stays in the fence it is in.
+    Stay,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -147,6 +164,10 @@ pub enum Cond {
     },
     FoldersOnly,
     FilesOnly,
+    /// A file that is not a program, a shortcut or a shell namespace item (This PC, Recycle
+    /// Bin): last in the list, it takes every file the earlier rules left. `config.json` saves
+    /// it as `{"cond":"filesOnly","plain":true}`, which versions without it read as `filesOnly`.
+    PlainFiles,
     SizeMb {
         min: Option<f64>,
         max: Option<f64>,
@@ -184,12 +205,12 @@ pub struct ItemFacts {
     pub is_system: bool,
     /// Whole days since the later of last write and last open; `None` when unknown.
     pub idle_days: Option<u32>,
+    /// Seconds since the later of creation and last write; `None` when unknown.
+    pub age_secs: Option<u64>,
 }
 
-/// Extensions that are never routed (downloads in flight, Office lock files…).
+/// Extensions that are never routed (downloads in flight).
 pub const TEMPORARY_EXTS: &[&str] = &[
-    ".tmp",
-    ".bak",
     ".crdownload",
     ".part",
     ".partial",
@@ -205,10 +226,17 @@ pub fn ext_of(file_name: &str) -> String {
     }
 }
 
-/// Is this a temporary/in-flight file that rules must skip?
-pub fn is_temporary(file_name: &str) -> bool {
+/// How long a `.tmp` file must have lasted before the rules route it: an Office "safe save"
+/// writes one and renames it over the document in the same moment.
+pub const TMP_SETTLE_SECS: u64 = 60;
+
+/// Is this a temporary/in-flight file that rules must skip? Office lock files and downloads in
+/// flight always; a `.tmp` until it has lasted [`TMP_SETTLE_SECS`] (`age_secs` unknown: not yet).
+pub fn is_temporary(file_name: &str, age_secs: Option<u64>) -> bool {
     let lower = file_name.to_lowercase();
-    lower.starts_with("~$") || TEMPORARY_EXTS.iter().any(|e| lower.ends_with(e))
+    lower.starts_with("~$")
+        || TEMPORARY_EXTS.iter().any(|e| lower.ends_with(e))
+        || (lower.ends_with(".tmp") && !age_secs.is_some_and(|s| s >= TMP_SETTLE_SECS))
 }
 
 /// The categories in the order [`classify`] reports them. A `.lnk` to a program counts as a
@@ -284,6 +312,7 @@ fn category_matches(cat: TypeCategory, facts: &ItemFacts) -> bool {
                         | ".ods"
                         | ".odp"
                         | ".csv"
+                        | ".tsv"
                         | ".one"
                         | ".epub"
                         | ".json"
@@ -385,7 +414,8 @@ pub fn cond_matches(cond: &Cond, facts: &ItemFacts) -> bool {
     match cond {
         Cond::Type(cats) => cats.iter().any(|c| category_matches(*c, facts)),
         Cond::Ext(exts) => {
-            let ext = ext_of(&facts.file_name);
+            // A suffix match, so `tar.gz` and dot files such as `.gitignore` match too.
+            let name = facts.file_name.to_lowercase();
             exts.iter().any(|e| {
                 let e = e.to_lowercase();
                 let e = if e.starts_with('.') {
@@ -393,7 +423,7 @@ pub fn cond_matches(cond: &Cond, facts: &ItemFacts) -> bool {
                 } else {
                     format!(".{e}")
                 };
-                e == ext
+                name.ends_with(&e)
             })
         }
         Cond::ExactName(names) => names
@@ -408,6 +438,12 @@ pub fn cond_matches(cond: &Cond, facts: &ItemFacts) -> bool {
             .unwrap_or(false),
         Cond::FoldersOnly => facts.is_folder,
         Cond::FilesOnly => !facts.is_folder,
+        Cond::PlainFiles => {
+            !facts.is_folder
+                && facts.origin != Origin::Namespace
+                && !category_matches(TypeCategory::Programs, facts)
+                && !category_matches(TypeCategory::Shortcuts, facts)
+        }
         Cond::SizeMb { min, max } => {
             let mb = facts.size_bytes as f64 / (1024.0 * 1024.0);
             min.is_none_or(|m| mb >= m) && max.is_none_or(|m| mb <= m)
@@ -444,7 +480,7 @@ pub enum Decision {
 
 impl RuleSet {
     pub fn evaluate(&self, facts: &ItemFacts) -> Decision {
-        if is_temporary(&facts.file_name)
+        if is_temporary(&facts.file_name, facts.age_secs)
             || facts.is_system
             || facts.file_name.eq_ignore_ascii_case("desktop.ini")
         {
@@ -483,6 +519,7 @@ impl RuleSet {
         Self {
             default_target: Target::Inbox,
             keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
             list: vec![
                 Rule::new(
                     crate::i18n::text("程序与快捷方式"),
@@ -510,6 +547,41 @@ impl RuleSet {
                 ),
             ],
         }
+    }
+}
+
+/// How `config.json` stores the rules (`#[serde(with)]` on `Config::rules`): a 「普通文件」
+/// condition is written as `{"cond":"filesOnly","plain":true}`. Versions without it (0.2.1 and
+/// older) read that as 「仅文件」; an unknown `"cond"` would make them refuse the whole file.
+pub mod saved {
+    use super::RuleSet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_json::{Value, json};
+
+    fn conds(rules: &mut Value) -> impl Iterator<Item = &mut Value> {
+        rules
+            .get_mut("list")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule.get_mut("allOf").and_then(Value::as_array_mut))
+            .flatten()
+    }
+
+    pub fn serialize<S: Serializer>(rules: &RuleSet, s: S) -> Result<S::Ok, S::Error> {
+        let mut v = serde_json::to_value(rules).map_err(serde::ser::Error::custom)?;
+        for c in conds(&mut v).filter(|c| c["cond"] == "plainFiles") {
+            *c = json!({ "cond": "filesOnly", "plain": true });
+        }
+        v.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RuleSet, D::Error> {
+        let mut v = Value::deserialize(d)?;
+        for c in conds(&mut v).filter(|c| c["cond"] == "filesOnly" && c["plain"] == true) {
+            *c = json!({ "cond": "plainFiles" });
+        }
+        RuleSet::deserialize(v).map_err(serde::de::Error::custom)
     }
 }
 
@@ -606,6 +678,7 @@ mod tests {
     fn classify_names_the_first_matching_category() {
         let kind = |name: &str| classify(&facts(name)).map(category_name);
         assert_eq!(kind("report.PDF"), Some("documents"));
+        assert_eq!(kind("table.tsv"), Some("documents"));
         assert_eq!(kind("photo.jpeg"), Some("images"));
         assert_eq!(kind("song.mp3"), Some("music"));
         assert_eq!(kind("clip.mkv"), Some("video"));
@@ -642,6 +715,29 @@ mod tests {
         assert_eq!(rs.evaluate(&facts("desktop.ini")), Decision::Skip);
     }
 
+    /// A `.bak` is a file like any other; a `.tmp` too once it has lasted a while (Word's
+    /// `~WRD0000.tmp` is renamed over the document in the same moment).
+    #[test]
+    fn tmp_files_are_skipped_only_while_fresh_and_bak_files_are_routed() {
+        let rs = RuleSet::default();
+        assert_eq!(
+            rs.evaluate(&facts("notes.bak")),
+            Decision::Default(Target::Inbox)
+        );
+        let mut tmp = facts("~WRD0000.tmp");
+        assert_eq!(rs.evaluate(&tmp), Decision::Skip);
+        tmp.age_secs = Some(TMP_SETTLE_SECS - 1);
+        assert_eq!(rs.evaluate(&tmp), Decision::Skip);
+        tmp.age_secs = Some(TMP_SETTLE_SECS);
+        assert_eq!(rs.evaluate(&tmp), Decision::Default(Target::Inbox));
+        // Age makes no difference to the other temporary names.
+        let mut lock = facts("~$report.docx");
+        lock.age_secs = Some(3600);
+        assert_eq!(rs.evaluate(&lock), Decision::Skip);
+        assert!(is_temporary("Report.TMP", None));
+        assert!(!is_temporary("Report.TMP", Some(TMP_SETTLE_SECS)));
+    }
+
     #[test]
     fn presets_route_by_type_and_default_to_inbox() {
         let (p, f, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
@@ -664,11 +760,135 @@ mod tests {
     }
 
     #[test]
+    fn plain_files_leave_out_folders_programs_shortcuts_and_namespace_items() {
+        let plain = |f: &ItemFacts| cond_matches(&Cond::PlainFiles, f);
+        for name in [
+            "page.html",
+            "query.sql",
+            "data.xml",
+            "notes.txt",
+            "a.zip",
+            "README",
+        ] {
+            assert!(plain(&facts(name)), "{name}");
+        }
+        for name in [
+            "tool.exe",
+            "run.bat",
+            "setup.msi",
+            "app.appref-ms",
+            "site.url",
+        ] {
+            assert!(!plain(&facts(name)), "{name}");
+        }
+        // A .lnk is a shortcut whatever it points to.
+        let mut lnk = facts("Report.lnk");
+        lnk.shortcut_target_ext = Some(".docx".into());
+        assert!(!plain(&lnk));
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert!(!plain(&folder));
+        let mut bin = facts("Recycle Bin");
+        bin.origin = Origin::Namespace;
+        assert!(!plain(&bin));
+    }
+
+    /// #70 / #71: type rules first, a 「普通文件」 rule last takes the files they leave.
+    #[test]
+    fn a_final_plain_files_rule_takes_what_the_type_rules_leave() {
+        let [archives, folders, docs, images, other] = [(); 5].map(|_| Uuid::new_v4());
+        let type_rule = |cat, to| Rule::new("t", Target::Fence(to), vec![Cond::Type(vec![cat])]);
+        let mut rs = RuleSet {
+            list: vec![
+                type_rule(TypeCategory::Archives, archives),
+                type_rule(TypeCategory::Folders, folders),
+                type_rule(TypeCategory::Documents, docs),
+                type_rule(TypeCategory::Images, images),
+                Rule::new("other", Target::Fence(other), vec![Cond::PlainFiles]),
+            ],
+            ..Default::default()
+        };
+        let to = |rs: &RuleSet, f: &ItemFacts| match rs.evaluate(f) {
+            Decision::Route {
+                target: Target::Fence(id),
+                ..
+            } => Some(id),
+            _ => None,
+        };
+        assert_eq!(to(&rs, &facts("backup.7z")), Some(archives));
+        assert_eq!(to(&rs, &facts("report.docx")), Some(docs));
+        assert_eq!(to(&rs, &facts("table.tsv")), Some(docs));
+        assert_eq!(to(&rs, &facts("photo.png")), Some(images));
+        for n in ["query.sql", "page.html", "data.qwe", "LICENSE"] {
+            assert_eq!(to(&rs, &facts(n)), Some(other), "{n}");
+        }
+        let mut folder = facts("Projects");
+        folder.is_folder = true;
+        assert_eq!(to(&rs, &folder), Some(folders));
+        for n in ["tool.exe", "Steam.lnk", "site.url"] {
+            assert_eq!(
+                rs.evaluate(&facts(n)),
+                Decision::Default(Target::Inbox),
+                "{n}"
+            );
+        }
+        // .xml is a document type: a documents rule by extension list leaves it to 「普通文件」.
+        assert_eq!(to(&rs, &facts("data.xml")), Some(docs));
+        rs.list[2] = Rule::new(
+            "docs",
+            Target::Fence(docs),
+            vec![Cond::Ext(vec!["docx".into(), "pdf".into()])],
+        );
+        assert_eq!(to(&rs, &facts("data.xml")), Some(other));
+    }
+
+    #[test]
+    fn unmatched_defaults_to_the_default_target_and_old_rule_sets_load() {
+        let rs: RuleSet =
+            serde_json::from_str(r#"{"defaultTarget":"inbox","keepUpdated":true,"list":[]}"#)
+                .unwrap();
+        assert_eq!(rs.unmatched, Unmatched::DefaultTarget);
+        let json = serde_json::to_value(RuleSet {
+            unmatched: Unmatched::Stay,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(json["unmatched"], "stay");
+        let cond: Cond = serde_json::from_str(r#"{"cond":"plainFiles","value":null}"#).unwrap();
+        assert_eq!(cond, Cond::PlainFiles);
+    }
+
+    /// A config with a 「普通文件」 rule must still load in 0.2.1, whose `Cond` has no such
+    /// variant: the file spells it `filesOnly` plus a key 0.2.1 ignores.
+    #[test]
+    fn plain_files_are_saved_in_a_form_older_versions_read() {
+        let mut cfg = crate::Config::default();
+        let conds = vec![Cond::FilesOnly, Cond::PlainFiles];
+        cfg.rules
+            .list
+            .push(Rule::new("r", Target::Inbox, conds.clone()));
+        let text = serde_json::to_string(&cfg).unwrap();
+        assert!(!text.contains("plainFiles"), "{text}");
+        assert!(text.contains(r#"[{"cond":"filesOnly"},{"cond":"filesOnly","plain":true}]"#));
+        let old: Cond = serde_json::from_str(r#"{"cond":"filesOnly","plain":true}"#).unwrap();
+        assert_eq!(old, Cond::FilesOnly);
+        let back: crate::Config = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.rules.list[0].all_of, conds);
+        // The settings page and the CLI see the rule set itself, with its own name.
+        assert!(
+            serde_json::to_string(&cfg.rules)
+                .unwrap()
+                .contains("plainFiles")
+        );
+    }
+
+    #[test]
     fn target_class_rules_win_regardless_of_order() {
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let rs = RuleSet {
             default_target: Target::Inbox,
             keep_updated: true,
+            unmatched: Unmatched::DefaultTarget,
             list: vec![
                 Rule::new(
                     "all lnk",
@@ -704,6 +924,19 @@ mod tests {
         let mut folder = facts("Setup");
         folder.is_folder = true;
         assert!(!category_matches(TypeCategory::Installers, &folder));
+    }
+
+    #[test]
+    fn ext_conditions_match_multi_part_extensions_and_dot_files() {
+        let ext = |e: &str, name: &str| cond_matches(&Cond::Ext(vec![e.into()]), &facts(name));
+        assert!(ext("pdf", "Report.PDF"));
+        assert!(ext(".pdf", "report.pdf"));
+        assert!(!ext("pdf", "report.pdf.txt"));
+        assert!(ext("tar.gz", "archive.tar.gz"));
+        assert!(ext("gz", "archive.tar.gz"));
+        assert!(!ext("tar.gz", "archive.gz"));
+        assert!(ext("gitignore", ".gitignore"));
+        assert!(!ext("pdf", "pdf"));
     }
 
     #[test]

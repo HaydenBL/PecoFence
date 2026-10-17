@@ -170,6 +170,7 @@
     WM_DWMCOLORIZATIONCOLORCHANGED
     WM_ENDSESSION
     WM_QUERYENDSESSION
+    WM_CANCELMODE
     MINMAXINFO
     HTCLIENT
     HTCAPTION
@@ -353,6 +354,7 @@
     PROCESS_MEMORY_COUNTERS_EX2
     PROCESS_MEMORY_COUNTERS_EX
     PROCESS_MEMORY_COUNTERS
+    QueryWorkingSet
 
     // ---- CLI named pipe (pecofence-cli IPC)
     CreateNamedPipeW
@@ -453,6 +455,7 @@
     SM_CXDOUBLECLK
     SM_CYDOUBLECLK
     SM_SWAPBUTTON
+    SM_SHUTTINGDOWN
 
     // ---- test tooling
     keybd_event
@@ -561,6 +564,9 @@
     WICBitmapUseAlpha
     WICBitmapIgnoreAlpha
     GetFileAttributesW
+    MoveFileExW
+    MultiByteToWideChar
+    CP_ACP
     FILE_ATTRIBUTE_HIDDEN
     FILE_ATTRIBUTE_SYSTEM
     FILE_ATTRIBUTE_DIRECTORY
@@ -737,7 +743,12 @@
     RtlCaptureStackBackTrace
     GetModuleHandleExW
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+    GET_MODULE_HANDLE_EX_FLAG_PIN
+    FindResourceW
+    LoadResource
+    LockResource
+    SizeofResource
+    RT_VERSION
     MiniDumpWriteDump
     MINIDUMP_EXCEPTION_INFORMATION
     MiniDumpWithIndirectlyReferencedMemory

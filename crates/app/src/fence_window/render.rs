@@ -259,6 +259,8 @@ impl FenceViewState {
             pecofence_core::i18n::text("没有未归类的项目")
         } else if self.drop_hover {
             pecofence_core::i18n::text("松开即可放入")
+        } else if self.is_portal && self.portal_missing {
+            pecofence_core::i18n::text("找不到此文件夹。")
         } else if self.is_portal {
             pecofence_core::i18n::text("此文件夹为空。")
         } else {
@@ -334,6 +336,7 @@ impl FenceViewState {
             merge_hint: self.merge_t.value_at(now),
             plate_top,
             plate_clear,
+            strip_clip: self.tab_strip_clip(),
         }
     }
 
@@ -352,13 +355,14 @@ impl FenceViewState {
     pub(super) fn draw_chrome_panel(&mut self) -> Result<()> {
         let now = Instant::now();
         let state = self.title_state(now);
-        // DIP height the crop covers (taller than the surface mid height animation).
-        let crop_h = self
-            .backdrop_rect
-            .map_or(0.0, |(_, _, _, h)| h as f32 / self.scale());
+        // DIP size the crop covers (larger than the surface mid size animation).
+        let (crop_w, crop_h) = self.backdrop_rect.map_or((0.0, 0.0), |(_, _, w, h)| {
+            (w as f32 / self.scale(), h as f32 / self.scale())
+        });
         let crop = self.backdrop_crop.as_ref().map(|img| BackdropCrop {
             image: img,
             key: &self.backdrop_key,
+            width: crop_w,
             height: crop_h,
         });
         let wallpaper = self.backdrops.for_mode(self.backdrop_mode()).clone();
@@ -406,19 +410,24 @@ impl FenceViewState {
         if dragging.is_some() {
             self.pill_anim = None;
         }
-        // Active pill mid-glide: drawn at the tweened place instead of on the active tab.
-        let pill = self
-            .pill_anim
-            .map(|(x, w)| (x.value_at(now), w.value_at(now)));
+        // Active pill mid-glide: drawn at the tweened place instead of on the active tab. The
+        // glide's end was the tab's rect when it started; once it is done the active tab draws
+        // its own fill, so a strip that changed width meanwhile (Peek badges) is not left with
+        // the pill at the old place.
         if self
             .pill_anim
             .is_some_and(|(x, w)| x.is_done(now) && w.is_done(now))
         {
             self.pill_anim = None;
         }
+        let pill = self
+            .pill_anim
+            .map(|(x, w)| (x.value_at(now), w.value_at(now)));
         let deco = self.deco;
         let style = FenceStyle {
             title_align: self.behavior.title_align.get(),
+            tab_rail: self.rail_w(),
+            hide_count_and_chevron: self.behavior.hide_count_and_chevron.get(),
             ..self.style
         };
         let pressed_tab = match self.pressed {
@@ -438,6 +447,7 @@ impl FenceViewState {
                 title: &t.title,
                 title_size: t.title_size,
                 title_color: t.title_color,
+                folder_icon: t.folder_icon,
                 active: i == active,
                 hover: self.chrome_fades.value(&ChromeKey::Tab(i), now),
                 pressed: pressed_tab == Some(i),
@@ -509,22 +519,28 @@ impl FenceViewState {
     /// Also accepts a pending pure move, so the GPU surface is prepared before Windows
     /// changes the HWND position. Only a tiny contrast sample is computed on the CPU.
     pub(super) fn update_backdrop_at(&mut self, r: RECT) -> bool {
-        let w = r.right - r.left;
+        let mut w = r.right - r.left;
         let mut h = r.bottom - r.top;
         // Liquid Glass's displacement field is rebuilt by the GPU renderer only on
         // size/DPI changes; position changes retain every uploaded image.
-        if !self.theme.liquid_glass
-            && let Some(target) = self.height_target_px()
-        {
-            h = h.max(target);
+        if !self.theme.liquid_glass {
+            if let Some(target) = self.height_target_px() {
+                h = h.max(target);
+            }
+            // Collapsing to a left tab column (or expanding from it) moves the width too.
+            if let Some(target) = self.width_target_px() {
+                w = w.max(target);
+            }
         }
+        let shrinking = !self.theme.liquid_glass && self.height_animating();
         if self.backdrop_crop.is_some()
             && let Some((l, t, cw, ch)) = self.backdrop_rect
-            && (l, t, cw) == (r.left, r.top, w)
-            && (ch == h || (!self.theme.liquid_glass && self.height_animating() && ch >= h))
+            && (l, t) == (r.left, r.top)
+            && (cw == w || (shrinking && cw >= w))
+            && (ch == h || (shrinking && ch >= h))
         {
-            // Same rect, or a collapse / shrink whose crop (cut for the taller start) still
-            // covers the visible band: the surface clips it.
+            // Same rect, or a collapse / shrink whose crop (cut for the larger start) still
+            // covers the visible part: the surface clips it.
             return false;
         }
         let want = (r.left, r.top, w, h);
@@ -572,7 +588,8 @@ impl FenceViewState {
         self.update_backdrop();
     }
 
-    /// Lays out the content panel below the title bar and resizes both surfaces.
+    /// Lays out the content panel below the title bar (and beside a left tab column) and
+    /// resizes both surfaces.
     pub(super) fn layout_panels(&mut self, w: i32, h: i32) -> Result<()> {
         // A content swap still moving would be laid out at the wrong size: settle it first.
         self.finish_content_swap_now();
@@ -581,12 +598,20 @@ impl FenceViewState {
             .set_center(&self.root, w as f32 / 2.0, h as f32 / 2.0);
         self.update_shape_clip(w, h)?;
         self.chrome_panel.resize(w, h)?;
-        let title_h = self.title_h_px();
-        let content_h = (h - title_h).max(1);
-        self.content_panel.resize(w, content_h)?;
+        // A fence collapsed (or collapsing) to its left tab column keeps the width it returns
+        // to; the column's width follows the expanded fence.
+        if !self.column_collapsed && self.roll_anim.as_ref().is_none_or(|a| a.width.is_none()) {
+            self.expanded_w_px = w;
+        }
+        self.rail_dip = self.measure_rail_w();
+        self.content_x = self.rail_px();
+        self.content_y = self.head_px();
+        let content_h = (h - self.content_y).max(1);
+        self.content_panel
+            .resize((w - self.content_x).max(1), content_h)?;
         self.content_panel
             .visual
-            .set_offset(0.0, title_h as f32, 0.0);
+            .set_offset(self.content_x as f32, self.content_y as f32, 0.0);
         self.content_panel
             .visual
             .set_visible(!self.rolled_up || self.roll_anim.is_some());
@@ -621,8 +646,10 @@ impl FenceViewState {
     }
 
     /// `label_w` is the width the label must fit: the cell width for icons, the name column's
-    /// text width for rows. Changing it drops every fitted label.
-    pub(super) fn ensure_icons_and_labels(&mut self, label_w: f32) {
+    /// text width for rows. Changing it drops every fitted label. Icons are asked for the items
+    /// `near` the viewport only; the others get theirs when they scroll in (a crowded fence
+    /// would otherwise extract every thumbnail at startup).
+    pub(super) fn ensure_icons_and_labels(&mut self, label_w: f32, near: impl Fn(usize) -> bool) {
         let icon_px = (self.icon_dip() * self.scale()).round() as u32;
         if (self.label_w - label_w).abs() > 0.5 {
             self.label_w = label_w;
@@ -632,12 +659,16 @@ impl FenceViewState {
             self.unfold_cache = None;
         }
         let details = self.layout == ViewLayout::Details;
+        // Explorer's list and details rows show folders without the preview of their contents.
+        let rows = self.layout != ViewLayout::Icons;
         let now = Instant::now();
         let mut started = false;
+        let mut pending = false;
         let mut icons = self.icons.borrow_mut();
-        for item in &mut self.items {
-            if item.wants_icon(icon_px) {
-                match icons.get(&item.icon_key, &item.path, icon_px, item.icon_only) {
+        for (i, item) in self.items.iter_mut().enumerate() {
+            if item.wants_icon(icon_px) && near(i) {
+                let icon_only = item.icon_only || (rows && item.is_folder);
+                match icons.get(&item.icon_key, &item.path, icon_px, self.dpi, icon_only) {
                     Lookup::Ready(Some(img)) => {
                         item.icon = Some(img);
                         item.icon_px = icon_px;
@@ -656,7 +687,10 @@ impl FenceViewState {
                     Lookup::Ready(None) => item.icon_failed = true,
                     // Another size's bitmap is the same picture: it stays up, and the sharper
                     // one replaces it without the fade.
-                    Lookup::Pending => item.icon_waited = item.icon.is_none(),
+                    Lookup::Pending => {
+                        item.icon_waited = item.icon.is_none();
+                        pending = true;
+                    }
                 }
             }
             if item.label.is_none() {
@@ -689,15 +723,16 @@ impl FenceViewState {
             }
         }
         drop(icons);
+        self.icons_pending = pending;
         if started {
             self.frames.request();
         }
     }
 
-    /// True when some item is still waiting for its icon.
+    /// True when an item near the viewport is still waiting for its icon (as of the last
+    /// content draw).
     pub fn has_pending_icons(&self) -> bool {
-        let px = (self.icon_dip() * self.scale()).round() as u32;
-        self.items.iter().any(|i| i.wants_icon(px))
+        self.icons_pending
     }
 
     /// Redraws the chrome surface only (backdrop/title); the content surface is untouched.
@@ -768,23 +803,29 @@ impl FenceViewState {
         if self.row_metrics().is_some() {
             return self.redraw_rows();
         }
-        let (cw, ch) = self.content_size_px();
+        let (cw, _) = self.content_size_px();
         let scale = self.scale();
         let width_dip = cw as f32 / scale;
-        let height_dip = ch as f32 / scale;
         let layout = self.layout(width_dip);
         let ItemLayout::Grid(grid) = &layout else {
             return Ok(());
         };
-        let max_scroll = grid.max_scroll(height_dip);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        self.ensure_icons_and_labels(grid.metrics.cell_w);
+        let view_h = self.scroll_view_h(&layout);
+        self.scroll_y = self.scroll_y.clamp(0.0, grid.max_scroll(view_h));
+        let scroll = self.scroll_y;
+        // The rows in view plus one viewport above and below, and the same around where a
+        // running glide ends (End, PageDown, a thumb drag, a Peek reveal).
+        let target = self.scroll_target();
+        let near = |y: f32, h: f32, at: f32| y + h > at - view_h && y < at + 2.0 * view_h;
+        self.ensure_icons_and_labels(grid.metrics.cell_w, |i| {
+            let c = grid.cell(i);
+            near(c.y, c.h, scroll) || near(c.y, c.h, target)
+        });
 
         let now = Instant::now();
         self.prune_content_motion(now);
         self.sync_scrollbar_alpha();
         let alphas = self.item_alphas(now);
-        let scroll = self.scroll_y;
         let dragging = self.ole_drag;
         let cut = self.cut.clone();
         let pressed = match self.pressed {
@@ -814,11 +855,27 @@ impl FenceViewState {
                 .filter(|c| c.id == id)
                 .map(|c| (c.text.as_str(), c.lines))
         });
+        // Only the cells in the viewport are prepared (`draw_content` skips the others anyway);
+        // an item gliding in from outside counts where it is drawn.
+        let placed: Vec<(usize, f32, f32, f32)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let c = grid.cell(i);
+                let (x, y, alpha) = match self.item_motion.get(&item.id) {
+                    Some(m) => (m.x.value_at(now), m.y.value_at(now), m.alpha.value_at(now)),
+                    None => (c.x, c.y, 1.0),
+                };
+                let y = y - scroll;
+                (y + c.h >= 0.0 && y <= view_h).then_some((i, x, y, alpha))
+            })
+            .collect();
         let keys: Vec<String> = {
             let icons = self.icons.borrow();
-            self.items
+            placed
                 .iter()
-                .map(|i| icons.draw_key(&i.icon_key, i.icon_px))
+                .map(|&(i, ..)| icons.draw_key(&self.items[i].icon_key, self.items[i].icon_px))
                 .collect()
         };
         // Removed items fade out beneath everything else (painted first).
@@ -845,18 +902,15 @@ impl FenceViewState {
                 full_label: None,
             })
             .collect();
-        cells.extend(self.items.iter().enumerate().map(|(i, item)| {
+        cells.extend(placed.iter().zip(&keys).map(|(&(i, x, y, alpha), key)| {
+            let item = &self.items[i];
             let c = grid.cell(i);
-            let (x, y, alpha) = match self.item_motion.get(&item.id) {
-                Some(m) => (m.x.value_at(now), m.y.value_at(now), m.alpha.value_at(now)),
-                None => (c.x, c.y, 1.0),
-            };
             ItemCell {
                 x,
-                y: y - scroll,
+                y,
                 w: c.w,
                 h: c.h,
-                icon_key: &keys[i],
+                icon_key: key,
                 icon: item.icon.as_deref(),
                 label: item.label.as_deref().unwrap_or(&item.name),
                 hover: alphas[i].0,
@@ -882,27 +936,34 @@ impl FenceViewState {
             icon_top: grid.metrics.icon_top,
             label_gap: grid.metrics.label_gap,
             scrollbar,
-            empty_text: Some(self.empty_text()),
+            // `cells` holds the viewport only; the hint is for a fence without items.
+            empty_text: self.items.is_empty().then(|| self.empty_text()),
             drop_highlight: self.drop_wash.value_at(now),
             marquee: self.marquee_rect_dip(),
             insert_caret: self.insert_caret_dip(0.0),
             insert_caret_alpha: self.caret_alpha.value_at(now),
             selection_inactive: self.selection_inactive_now(now),
+            items_bottom: view_h,
         };
-        let theme = self.material_foreground();
+        let theme = self
+            .material_foreground()
+            .with_label_color(self.behavior.label_color.get());
         let chrome = self.chrome.clone();
         let bitmaps = self.bitmaps.clone();
-        let ok = self.content_panel.draw(self.dpi, |session, wd, hd| {
-            chrome.draw_content(
-                session,
-                &theme,
-                scale,
-                &mut bitmaps.borrow_mut(),
-                wd,
-                hd,
-                &content,
-            )
-        })?;
+        let ok = self
+            .content_panel
+            .draw_ex(self.dpi, |session, clip, wd, hd| {
+                chrome.draw_content(
+                    session,
+                    Some(clip),
+                    &theme,
+                    scale,
+                    &mut bitmaps.borrow_mut(),
+                    wd,
+                    hd,
+                    &content,
+                )
+            })?;
         self.note_draw_result(ok);
         self.note_content_fades(now);
         Ok(())
@@ -913,23 +974,28 @@ impl FenceViewState {
         let Some(metrics) = self.row_metrics() else {
             return Ok(());
         };
-        let (cw, ch) = self.content_size_px();
+        let (cw, _) = self.content_size_px();
         let scale = self.scale();
         let width_dip = cw as f32 / scale;
-        let height_dip = ch as f32 / scale;
         let layout = self.layout(width_dip);
-        let view_h = (height_dip - metrics.header_h).max(1.0);
-        let max_scroll = layout.max_scroll(view_h);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let view_h = self.scroll_view_h(&layout);
+        self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll(view_h));
         let cols = self.columns_for(width_dip);
         let text_w = (cols.name_w - metrics.icon - 8.0 - 4.0).max(20.0);
-        self.ensure_icons_and_labels(text_w);
+        let scroll = self.scroll_y;
+        // The rows in view plus one viewport above and below, and the same around where a
+        // running glide ends (as in `redraw_content`).
+        let target = self.scroll_target();
+        let near = |y: f32, h: f32, at: f32| y + h > at - view_h && y < at + 2.0 * view_h;
+        self.ensure_icons_and_labels(text_w, |i| {
+            let c = layout.cell(i);
+            near(c.y, c.h, scroll) || near(c.y, c.h, target)
+        });
 
         let now = Instant::now();
         self.prune_content_motion(now);
         self.sync_scrollbar_alpha();
         let alphas = self.item_alphas(now);
-        let scroll = self.scroll_y;
         let dragging = self.ole_drag;
         let cut = self.cut.clone();
         let pressed_item = match self.pressed {
@@ -966,11 +1032,28 @@ impl FenceViewState {
             self.header_fades.clear();
             Vec::new()
         };
+        // Only the rows in the viewport are prepared (`draw_rows` skips the others anyway); a
+        // row gliding in from outside counts where it is drawn.
+        let placed: Vec<(usize, f32, f32)> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| {
+                let c = layout.cell(i);
+                let (y, alpha) = match self.item_motion.get(&item.id) {
+                    Some(m) => (m.y.value_at(now), m.alpha.value_at(now)),
+                    None => (c.y, 1.0),
+                };
+                let y = y - scroll + metrics.header_h;
+                (y + c.h > metrics.header_h && y <= metrics.header_h + view_h)
+                    .then_some((i, y, alpha))
+            })
+            .collect();
         let keys: Vec<String> = {
             let icons = self.icons.borrow();
-            self.items
+            placed
                 .iter()
-                .map(|i| icons.draw_key(&i.icon_key, i.icon_px))
+                .map(|&(i, ..)| icons.draw_key(&self.items[i].icon_key, self.items[i].icon_px))
                 .collect()
         };
         // Removed rows fade out beneath everything else (painted first).
@@ -997,16 +1080,13 @@ impl FenceViewState {
                 icon_alpha: 1.0,
             })
             .collect();
-        rows.extend(self.items.iter().enumerate().map(|(i, item)| {
+        rows.extend(placed.iter().zip(&keys).map(|(&(i, y, alpha), key)| {
+            let item = &self.items[i];
             let c = layout.cell(i);
-            let (y, alpha) = match self.item_motion.get(&item.id) {
-                Some(m) => (m.y.value_at(now), m.alpha.value_at(now)),
-                None => (c.y, 1.0),
-            };
             RowCell {
-                y: y - scroll + metrics.header_h,
+                y,
                 h: c.h,
-                icon_key: &keys[i],
+                icon_key: key,
                 icon: item.icon.as_deref(),
                 name: item.label.as_deref().unwrap_or(&item.name),
                 date: item.date_label.as_deref().unwrap_or(""),
@@ -1025,7 +1105,8 @@ impl FenceViewState {
         }));
         let group_headers = group_header_draws(&layout, scroll, metrics.header_h);
         let scrollbar = self.scrollbar_draw();
-        let empty_text = Some(self.empty_text());
+        // `rows` holds the viewport only; the hint is for a fence without items.
+        let empty_text = self.items.is_empty().then(|| self.empty_text());
         let marquee = self.marquee_rect_dip().map(|m| Rect {
             left: m.left,
             top: m.top + metrics.header_h,
@@ -1055,12 +1136,20 @@ impl FenceViewState {
             insert_caret: self.insert_caret_dip(metrics.header_h),
             insert_caret_alpha: self.caret_alpha.value_at(now),
             selection_inactive: self.selection_inactive_now(now),
+            origin_x: self.content_x as f32 / self.scale(),
+            origin_y: self.content_y as f32 / self.scale(),
+            rows_bottom: metrics.header_h + view_h,
         };
-        let theme = self.material_foreground();
+        let label_color = self.behavior.label_color.get();
+        let theme = self.material_foreground().with_label_color(label_color);
         let chrome = self.chrome.clone();
         let bitmaps = self.bitmaps.clone();
         let wallpaper = self.backdrops.for_mode(self.backdrop_mode()).clone();
-        let backdrop = if self.theme.liquid_glass && !wallpaper.is_empty() {
+        // The glass is sampled under each text only to pick its ink: a fixed name colour skips it.
+        let backdrop = if self.theme.liquid_glass
+            && !wallpaper.is_empty()
+            && label_color == pecofence_core::LabelColor::Auto
+        {
             let r = self.backdrop_rect.unwrap_or_else(|| {
                 let r = window::window_rect(self.hwnd);
                 (r.left, r.top, r.right - r.left, r.bottom - r.top)
