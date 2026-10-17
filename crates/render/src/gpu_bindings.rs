@@ -12,6 +12,10 @@ pub const CLSID_D2D1DisplacementMap: windows_core::GUID =
     windows_core::GUID::from_u128(0xedc48364_0417_4111_9450_43845fa9f890);
 pub const CLSID_D2D1GaussianBlur: windows_core::GUID =
     windows_core::GUID::from_u128(0x1feb6d69_2fe6_4ac9_8c58_1d7f93e7a6a5);
+pub const CLSID_D2D1Morphology: windows_core::GUID =
+    windows_core::GUID::from_u128(0xeae6c40d_626a_4c2d_bfcb_391001abe202);
+pub const CLSID_D2D1Shadow: windows_core::GUID =
+    windows_core::GUID::from_u128(0xc67ea361_1863_4e69_89db_695d3e9a5b6b);
 pub type D2D1_2DAFFINETRANSFORM_PROP = i32;
 pub const D2D1_2DAFFINETRANSFORM_PROP_TRANSFORM_MATRIX: D2D1_2DAFFINETRANSFORM_PROP = 2;
 pub type D2D1_ALPHA_MODE = i32;
@@ -159,6 +163,12 @@ pub struct D2D1_MAPPED_RECT {
     pub bits: *mut u8,
 }
 pub type D2D1_MAP_OPTIONS = u32;
+pub type D2D1_MORPHOLOGY_MODE = i32;
+pub const D2D1_MORPHOLOGY_MODE_DILATE: D2D1_MORPHOLOGY_MODE = 1;
+pub type D2D1_MORPHOLOGY_PROP = i32;
+pub const D2D1_MORPHOLOGY_PROP_HEIGHT: D2D1_MORPHOLOGY_PROP = 2;
+pub const D2D1_MORPHOLOGY_PROP_MODE: D2D1_MORPHOLOGY_PROP = 0;
+pub const D2D1_MORPHOLOGY_PROP_WIDTH: D2D1_MORPHOLOGY_PROP = 1;
 pub type D2D1_OPACITY_MASK_CONTENT = i32;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -181,6 +191,8 @@ pub const D2D1_PROPERTY_TYPE_ENUM: D2D1_PROPERTY_TYPE = 11;
 pub const D2D1_PROPERTY_TYPE_FLOAT: D2D1_PROPERTY_TYPE = 5;
 pub const D2D1_PROPERTY_TYPE_MATRIX_3X2: D2D1_PROPERTY_TYPE = 14;
 pub const D2D1_PROPERTY_TYPE_MATRIX_5X4: D2D1_PROPERTY_TYPE = 17;
+pub const D2D1_PROPERTY_TYPE_UINT32: D2D1_PROPERTY_TYPE = 3;
+pub const D2D1_PROPERTY_TYPE_VECTOR4: D2D1_PROPERTY_TYPE = 8;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES {
@@ -214,6 +226,9 @@ pub struct D2D1_ROUNDED_RECT {
     pub radiusX: f32,
     pub radiusY: f32,
 }
+pub type D2D1_SHADOW_PROP = i32;
+pub const D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION: D2D1_SHADOW_PROP = 0;
+pub const D2D1_SHADOW_PROP_COLOR: D2D1_SHADOW_PROP = 1;
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct D2D1_TAG(pub u64);
@@ -1212,13 +1227,70 @@ windows_core::imp::interface_hierarchy!(
     ID2D1Resource,
     ID2D1Image
 );
+impl ID2D1CommandList {
+    pub(crate) unsafe fn Stream<P0>(&self, sink: P0) -> windows_core::HRESULT
+    where
+        P0: windows_core::Param<ID2D1CommandSink>,
+    {
+        unsafe {
+            (windows_core::Interface::vtable(self).Stream)(
+                windows_core::Interface::as_raw(self),
+                sink.param().abi(),
+            )
+        }
+    }
+    pub(crate) unsafe fn Close(&self) -> windows_core::HRESULT {
+        unsafe {
+            (windows_core::Interface::vtable(self).Close)(windows_core::Interface::as_raw(self))
+        }
+    }
+}
 #[repr(C)]
 pub struct ID2D1CommandList_Vtbl {
     pub base__: ID2D1Image_Vtbl,
-    Stream: usize,
-    Close: usize,
+    pub Stream: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+    ) -> windows_core::HRESULT,
+    pub Close: unsafe extern "system" fn(*mut core::ffi::c_void) -> windows_core::HRESULT,
 }
 impl windows_core::RuntimeName for ID2D1CommandList {}
+windows_core::imp::define_interface!(
+    ID2D1CommandSink,
+    ID2D1CommandSink_Vtbl,
+    0x54d7898a_a061_40a7_bec7_e465bcba2c4f
+);
+windows_core::imp::interface_hierarchy!(ID2D1CommandSink, windows_core::IUnknown);
+#[repr(C)]
+pub struct ID2D1CommandSink_Vtbl {
+    pub base__: windows_core::IUnknown_Vtbl,
+    BeginDraw: usize,
+    EndDraw: usize,
+    SetAntialiasMode: usize,
+    SetTags: usize,
+    SetTextAntialiasMode: usize,
+    SetTextRenderingParams: usize,
+    SetTransform: usize,
+    SetPrimitiveBlend: usize,
+    SetUnitMode: usize,
+    Clear: usize,
+    DrawGlyphRun: usize,
+    DrawLine: usize,
+    DrawGeometry: usize,
+    DrawRectangle: usize,
+    DrawBitmap: usize,
+    DrawImage: usize,
+    DrawGdiMetafile: usize,
+    FillMesh: usize,
+    FillOpacityMask: usize,
+    FillGeometry: usize,
+    FillRectangle: usize,
+    PushAxisAlignedClip: usize,
+    PushLayer: usize,
+    PopAxisAlignedClip: usize,
+    PopLayer: usize,
+}
+impl windows_core::RuntimeName for ID2D1CommandSink {}
 windows_core::imp::define_interface!(
     ID2D1Device,
     ID2D1Device_Vtbl,

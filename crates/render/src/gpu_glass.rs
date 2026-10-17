@@ -705,3 +705,73 @@ impl GpuGlass {
         Ok(())
     }
 }
+
+/// Draws a soft shadow of whatever `record` draws (text, in any brush colour): the drawing is
+/// recorded into a command list and drawn once through the Shadow effect, so a whole layer of
+/// labels costs one blur. `spread` thickens the strokes first (a blurred hairline glyph is
+/// otherwise only a faint haze). `spread`, `sigma` and `dy` are in DIPs.
+pub fn draw_shadow(
+    session: &DrawingSession<'_>,
+    color: windows_canvas::ColorF,
+    spread: f32,
+    sigma: f32,
+    dy: f32,
+    record: impl FnOnce(),
+) -> Result<()> {
+    let context: b::ID2D1DeviceContext = session.raw().cast()?;
+    unsafe {
+        let list = context.CreateCommandList()?;
+        let target = context.GetTarget()?;
+        let mut transform = Matrix3x2::default();
+        context.GetTransform(&mut transform);
+        // Recorded untransformed: drawing the list below applies the transform once.
+        context.SetTransform(&Matrix3x2::identity());
+        context.SetTarget(&list);
+        record();
+        context.SetTarget(&target);
+        context.SetTransform(&transform);
+        list.Close().ok()?;
+        let shadow = context.CreateEffect(&b::CLSID_D2D1Shadow)?;
+        let (mut dpi, mut _dpi_y) = (96.0, 96.0);
+        context.GetDpi(&mut dpi, &mut _dpi_y);
+        let radius = (spread * dpi / 96.0).round() as u32;
+        if radius > 0 {
+            let dilate = context.CreateEffect(&b::CLSID_D2D1Morphology)?;
+            dilate.SetInput(0, &list, true);
+            enumeration(
+                &dilate,
+                b::D2D1_MORPHOLOGY_PROP_MODE,
+                b::D2D1_MORPHOLOGY_MODE_DILATE,
+            )?;
+            for prop in [
+                b::D2D1_MORPHOLOGY_PROP_WIDTH,
+                b::D2D1_MORPHOLOGY_PROP_HEIGHT,
+            ] {
+                property(
+                    &dilate,
+                    prop,
+                    b::D2D1_PROPERTY_TYPE_UINT32,
+                    &(2 * radius + 1),
+                )?;
+            }
+            shadow.SetInput(0, &dilate.GetOutput()?, true);
+        } else {
+            shadow.SetInput(0, &list, true);
+        }
+        scalar(&shadow, b::D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, sigma)?;
+        property(
+            &shadow,
+            b::D2D1_SHADOW_PROP_COLOR,
+            b::D2D1_PROPERTY_TYPE_VECTOR4,
+            &[color.r, color.g, color.b, color.a],
+        )?;
+        context.DrawImage(
+            &shadow.GetOutput()?,
+            Some(&Vector2::new(0.0, dy)),
+            None,
+            b::D2D1_INTERPOLATION_MODE_LINEAR,
+            b::D2D1_COMPOSITE_MODE_SOURCE_OVER,
+        );
+    }
+    Ok(())
+}

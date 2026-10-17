@@ -234,9 +234,11 @@ fence shows no window and its items only show among the Windows desktop icons; a
 tabs stays; default off), `offerNewFence` (a rectangle drawn on empty desktop that touches no fence
 offers 「在此新建栅栏」; default on), `autostart`, `peek.enabled`, `quickHide.enabled`,
 `titleAlign` (left/center/right: the title and tab strip in every title row),
-`labelColor` (auto/white/black: the item names in every fence and view; auto picks dark or light
-names from the wallpaper in Liquid Glass and follows the colour mode in Fluent; fence titles keep
-their `titleColor`; default auto),
+`labelColor` (auto/perFence/white/black: the fence titles, tabs and item names in every fence and
+view; auto picks dark or light text from the wallpaper in Liquid Glass and follows the colour mode
+in Fluent; perFence (Liquid Glass) picks one colour per fence; anything but auto draws a soft
+shadow under the text instead of the outline; a fence's `titleColor` still wins for its title;
+default auto),
 `tabBar` (top/left: a fence with two or more tabs shows them in its title row, or lists them in a
 column on its left that takes the title row's place; rolled up, such a fence shrinks to the
 column; default top),
