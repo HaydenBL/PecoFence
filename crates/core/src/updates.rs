@@ -4,7 +4,8 @@
 
 use serde::Deserialize;
 
-pub const REPOSITORY: &str = "DayuanJiang/PecoFence";
+/// Hayden's build: only its own releases are offered, never upstream's.
+pub const REPOSITORY: &str = "HaydenBL/PecoFence";
 
 /// GitHub's newest published release; drafts and prereleases are never "latest".
 pub fn latest_release_url() -> String {
@@ -164,7 +165,7 @@ mod tests {
         // Not the response's html_url: that is never opened.
         assert_eq!(
             release.page,
-            "https://github.com/DayuanJiang/PecoFence/releases/tag/v0.1.4"
+            format!("https://github.com/{REPOSITORY}/releases/tag/v0.1.4")
         );
         assert_eq!(
             release.setup,
