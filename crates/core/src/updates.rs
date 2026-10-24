@@ -79,30 +79,43 @@ pub fn parse_release(json: &str, download_base: &str) -> Result<Release, String>
 
 /// `major.minor.patch`, with an optional `-prerelease` (letters, digits, `.`, `-`) that sorts
 /// before the release.
-fn parse_version(version: &str) -> Option<([u64; 3], bool)> {
+fn parse_version(version: &str) -> Option<([u64; 3], Option<&str>)> {
     let (numbers, prerelease) = match version.split_once('-') {
         Some((numbers, suffix)) => {
             let allowed = |b: u8| b.is_ascii_alphanumeric() || b == b'.' || b == b'-';
             if suffix.is_empty() || !suffix.bytes().all(allowed) {
                 return None;
             }
-            (numbers, true)
+            (numbers, Some(suffix))
         }
-        None => (version, false),
+        None => (version, None),
     };
     let mut parts = numbers.split('.').map(|p| p.parse::<u64>().ok());
     let parsed = [parts.next()??, parts.next()??, parts.next()??];
     parts.next().is_none().then_some((parsed, prerelease))
 }
 
+/// Hayden's builds follow upstream's number: `hayden` is 0, `hayden.1` the next build of it.
+fn hayden_build(suffix: &str) -> Option<u64> {
+    match suffix.strip_prefix("hayden")? {
+        "" => Some(0),
+        n => n.strip_prefix('.')?.parse().ok(),
+    }
+}
+
 /// Whether `candidate` should be offered to a copy running `current`. A prerelease is only
 /// offered to prerelease copies: a tag like `v0.2.0-beta.1` can still be GitHub's "latest".
 pub fn is_newer(candidate: &str, current: &str) -> bool {
     match (parse_version(candidate), parse_version(current)) {
-        (Some((_, true)), Some((_, false))) => false,
-        (Some((new, new_pre)), Some((old, old_pre))) => {
-            new > old || (new == old && old_pre && !new_pre)
-        }
+        (Some((_, Some(_))), Some((_, None))) => false,
+        (Some((new, new_pre)), Some((old, old_pre))) if new == old => match (new_pre, old_pre) {
+            (None, Some(_)) => true,
+            (Some(new), Some(old)) => hayden_build(new)
+                .zip(hayden_build(old))
+                .is_some_and(|(new, old)| new > old),
+            _ => false,
+        },
+        (Some((new, _)), Some((old, _))) => new > old,
         _ => false,
     }
 }
@@ -145,6 +158,17 @@ mod tests {
         assert!(!is_newer("0.1", "0.0.1"));
         assert!(!is_newer("0.1.4.1", "0.1.3"));
         assert!(!is_newer("latest", "0.1.3"));
+    }
+
+    #[test]
+    fn hayden_builds_of_one_version_are_ordered() {
+        assert!(is_newer("0.2.3-hayden.1", "0.2.3-hayden"));
+        assert!(is_newer("0.2.3-hayden.10", "0.2.3-hayden.9"));
+        assert!(is_newer("0.2.4-hayden", "0.2.3-hayden.3"));
+        assert!(!is_newer("0.2.3-hayden", "0.2.3-hayden.1"));
+        assert!(!is_newer("0.2.3-hayden.1", "0.2.3-hayden.1"));
+        assert!(!is_newer("0.2.3-hayden.x", "0.2.3-hayden"));
+        assert!(!is_newer("0.2.3-haydenx", "0.2.3-hayden"));
     }
 
     #[test]

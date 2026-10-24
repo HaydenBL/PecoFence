@@ -96,6 +96,10 @@ pub struct Settings {
     /// Material style is independent of the light/dark preference.
     #[serde(default)]
     pub theme_style: ThemeStyle,
+    /// A theme file in the configuration's `themes` folder, by name without `.json`. While it
+    /// loads, its `base` takes the place of `themeStyle`.
+    #[serde(default)]
+    pub custom_theme: Option<String>,
     /// Colour of the titles, tabs and item names in every fence; a fence's own `titleColor`
     /// still wins for its title.
     #[serde(default)]
@@ -218,6 +222,7 @@ impl Default for Settings {
             backdrop: Backdrop::Acrylic,
             theme: ThemeSetting::FollowWindowsMode,
             theme_style: ThemeStyle::Fluent,
+            custom_theme: None,
             label_color: LabelColor::Auto,
             title_align: TitleAlign::Left,
             tab_bar: TabBar::Top,
@@ -275,10 +280,10 @@ pub enum ThemeStyle {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "camelCase")]
 pub enum LabelColor {
+    // `perFence` came from 0.2.3-hayden.
     #[default]
+    #[serde(alias = "perFence")]
     Auto,
-    /// One colour for a fence's title, tabs and item names, chosen from its backdrop.
-    PerFence,
     White,
     Black,
 }
@@ -1654,8 +1659,10 @@ mod tests {
         json.as_object_mut().unwrap().remove("titleAlign");
         json.as_object_mut().unwrap().remove("tabBar");
         json.as_object_mut().unwrap().remove("labelColor");
+        json.as_object_mut().unwrap().remove("customTheme");
         let legacy: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(legacy.theme_style, ThemeStyle::Fluent);
+        assert_eq!(legacy.custom_theme, None);
         assert_eq!(legacy.title_align, TitleAlign::Left);
         assert_eq!(legacy.tab_bar, TabBar::Top);
         assert_eq!(legacy.label_color, LabelColor::Auto);

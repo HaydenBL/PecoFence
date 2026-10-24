@@ -1,6 +1,9 @@
 //! GPU glass over a shared wallpaper texture. Movement only updates a transform:
 //! the displacement field, specular ring, source upload and effect graph stay resident.
-use crate::{Image, MonitorBackdrop, gpu_bindings as b, theme::GlassLevel};
+use crate::{
+    Image, MonitorBackdrop, gpu_bindings as b,
+    theme::{GlassLevel, Lens},
+};
 use std::{
     collections::HashMap,
     rc::{Rc, Weak},
@@ -448,6 +451,7 @@ pub struct GpuGlass {
     stats: Stats,
     controls: HashMap<u128, Control>,
     text_inks: HashMap<u128, (bool, u64)>,
+    lens: Lens,
 }
 
 struct Control {
@@ -465,6 +469,11 @@ impl GpuGlass {
     }
     pub fn failed(&self) -> bool {
         self.failed
+    }
+
+    /// The theme's lens strength for the next draws (the plate and its controls).
+    pub fn set_lens(&mut self, lens: Lens) {
+        self.lens = lens;
     }
 
     /// Draws the plate lens for the screen rect `rect` at surface row `origin_y` (device px;
@@ -599,7 +608,8 @@ impl GpuGlass {
             self.stats.control_map_builds += 1;
         }
         // The parent surface is already frosted.
-        effects.set_material(0.0, 1.0)?;
+        effects.set_material(0.0, self.lens.refraction)?;
+        effects.set_light(RIM_LIGHT * self.lens.rim_light)?;
         let (x, y) = (rect.left * scale, rect.top * scale);
         // The parent surface starts at the plate top (`origin_y`), not at the window top.
         matrix(
@@ -674,7 +684,10 @@ impl GpuGlass {
             &effects.position,
             [1.0, 0.0, 0.0, 1.0, -rect[0] as f32, -rect[1] as f32],
         )?;
-        effects.set_material(level.frost_sigma_dip * scale, level.refraction)?;
+        effects.set_material(
+            level.frost_sigma_dip * scale,
+            level.refraction * self.lens.refraction,
+        )?;
         let alpha = alpha.clamp(0.0, 1.0);
         if effects.opacity != Some(alpha.to_bits()) {
             let mut values = [0.0; 20];
@@ -685,7 +698,9 @@ impl GpuGlass {
             effects.opacity = Some(alpha.to_bits());
         }
         // Hover lifts the rim light with the application's existing animation clock.
-        effects.set_light(RIM_LIGHT * level.light * (1.0 + 0.35 * hover.clamp(0.0, 1.0)))?;
+        effects.set_light(
+            RIM_LIGHT * level.light * self.lens.rim_light * (1.0 + 0.35 * hover.clamp(0.0, 1.0)),
+        )?;
         let area = b::D2D_RECT_F {
             left: 0.0,
             top: 0.0,

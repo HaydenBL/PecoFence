@@ -3,6 +3,7 @@
 //! Interaction tokens follow WinUI; cool neutral surfaces and directional glass edges give
 //! the desktop and settings a shared palette. Alpha is applied over the sampled backdrop.
 
+use crate::backdrop::MicaTint;
 use windows_canvas::ColorF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,8 +62,9 @@ pub struct Theme {
     pub focus_inner: ColorF,
     /// The opaque accent the selection tokens derive from (tray icon, settings page brand).
     pub accent: ColorF,
-    /// Window corner radius in DIPs. Both materials use 8, the Windows 11 top-level window
-    /// radius; Liquid Glass additionally clips the composition root to it (lens and shadow).
+    /// Window corner radius in DIPs: Fluent 8, the Windows 11 top-level window radius, and
+    /// Liquid Glass 16. The fence clips its own window to it (the composition root, so the
+    /// plate, lens and shadow share one silhouette); Windows does not round fences.
     pub corner_radius: f32,
     /// Title bar height in DIPs.
     pub title_height: f32,
@@ -71,6 +73,86 @@ pub struct Theme {
     pub text_halo: bool,
     /// The 文字颜色 setting the text was drawn for.
     pub label_color: pecofence_core::LabelColor,
+    /// The recipe the wallpaper behind the fences is blurred and tinted with (Liquid Glass
+    /// refracts the result).
+    pub material: MicaTint,
+    pub lens: Lens,
+    /// A theme file's shadow values (None = the style's own).
+    pub shadow: ShadowOverride,
+    /// A custom theme's light and dark ink, which the text switches to over a bright or a
+    /// dark backdrop (None = the built-in style's).
+    pub custom_inks: Option<[Ink; 2]>,
+}
+
+/// Liquid Glass lens strength, as multiples of the built-in refraction and rim light.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Lens {
+    pub refraction: f32,
+    pub rim_light: f32,
+}
+
+impl Lens {
+    pub const BUILT_IN: Self = Self {
+        refraction: 1.0,
+        rim_light: 1.0,
+    };
+}
+
+impl Default for Lens {
+    fn default() -> Self {
+        Self::BUILT_IN
+    }
+}
+
+/// Shadow values a theme file sets: peak opacity, blur sigma and downward offset in DIPs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ShadowOverride {
+    pub opacity: Option<f32>,
+    pub blur: Option<f32>,
+    pub offset: Option<f32>,
+}
+
+impl ShadowOverride {
+    pub const NONE: Self = Self {
+        opacity: None,
+        blur: None,
+        offset: None,
+    };
+}
+
+/// The text and control-feedback tokens that follow the backdrop under them (see
+/// [`Theme::over_glass`]): one style's light or dark set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ink {
+    text_primary: ColorF,
+    text_secondary: ColorF,
+    text_tertiary: ColorF,
+    control_strong: ColorF,
+    subtle_hover: ColorF,
+    subtle_pressed: ColorF,
+    tab_active_fill: ColorF,
+    selection_fill_inactive: ColorF,
+    selection_stroke_inactive: ColorF,
+    focus_outer: ColorF,
+    focus_inner: ColorF,
+}
+
+impl Ink {
+    pub fn of(theme: &Theme) -> Self {
+        Self {
+            text_primary: theme.text_primary,
+            text_secondary: theme.text_secondary,
+            text_tertiary: theme.text_tertiary,
+            control_strong: theme.control_strong,
+            subtle_hover: theme.subtle_hover,
+            subtle_pressed: theme.subtle_pressed,
+            tab_active_fill: theme.tab_active_fill,
+            selection_fill_inactive: theme.selection_fill_inactive,
+            selection_stroke_inactive: theme.selection_stroke_inactive,
+            focus_outer: theme.focus_outer,
+            focus_inner: theme.focus_inner,
+        }
+    }
 }
 
 impl Theme {
@@ -105,6 +187,10 @@ impl Theme {
             title_height: 36.0,
             text_halo: false,
             label_color: pecofence_core::LabelColor::Auto,
+            material: MicaTint::ACRYLIC_DARK,
+            lens: Lens::BUILT_IN,
+            shadow: ShadowOverride::NONE,
+            custom_inks: None,
         }
     }
 
@@ -139,27 +225,22 @@ impl Theme {
             title_height: 36.0,
             text_halo: false,
             label_color: pecofence_core::LabelColor::Auto,
+            material: MicaTint::ACRYLIC_LIGHT,
+            lens: Lens::BUILT_IN,
+            shadow: ShadowOverride::NONE,
+            custom_inks: None,
         }
     }
 
-    pub const fn mica_tint(&self) -> crate::backdrop::MicaTint {
+    pub const fn mica_tint(&self) -> MicaTint {
         match self.mode {
-            ThemeMode::Dark => crate::backdrop::MicaTint::MICA_DARK,
-            ThemeMode::Light => crate::backdrop::MicaTint::MICA_LIGHT,
+            ThemeMode::Dark => MicaTint::MICA_DARK,
+            ThemeMode::Light => MicaTint::MICA_LIGHT,
         }
     }
 
-    pub const fn acrylic_tint(&self) -> crate::backdrop::MicaTint {
-        if self.liquid_glass {
-            return match self.mode {
-                ThemeMode::Dark => crate::backdrop::MicaTint::LIQUID_DARK,
-                ThemeMode::Light => crate::backdrop::MicaTint::LIQUID_LIGHT,
-            };
-        }
-        match self.mode {
-            ThemeMode::Dark => crate::backdrop::MicaTint::ACRYLIC_DARK,
-            ThemeMode::Light => crate::backdrop::MicaTint::ACRYLIC_LIGHT,
-        }
+    pub const fn acrylic_tint(&self) -> MicaTint {
+        self.material
     }
 
     pub const fn for_mode(mode: ThemeMode) -> Self {
@@ -176,6 +257,10 @@ impl Theme {
     pub const fn with_liquid_glass(mut self) -> Self {
         self.liquid_glass = true;
         self.corner_radius = 16.0;
+        self.material = match self.mode {
+            ThemeMode::Dark => MicaTint::LIQUID_DARK,
+            ThemeMode::Light => MicaTint::LIQUID_LIGHT,
+        };
         self.glass_rim_top = ColorF::from_rgba8(0xFF, 0xFF, 0xFF, 0xCD);
         match self.mode {
             ThemeMode::Dark => {
@@ -290,16 +375,13 @@ impl Theme {
         tint: Option<ColorF>,
         previous_dark_text: Option<bool>,
     ) -> Self {
-        if !self.liquid_glass {
-            return self;
-        }
-        if image.bgra.is_empty() {
+        if !self.liquid_glass || image.bgra.is_empty() {
             return self;
         }
         let foreground = if self.prefers_dark_text(image, opacity, tint, previous_dark_text) {
-            Self::light().with_liquid_glass()
+            self.ink(ThemeMode::Light)
         } else {
-            Self::dark().with_liquid_glass()
+            self.ink(ThemeMode::Dark)
         };
         self.with_ink_of(foreground)
     }
@@ -322,17 +404,15 @@ impl Theme {
             return self;
         }
         let foreground = if self.prefers_dark_text(image, 1.0, tint, previous_dark_text) {
-            Self::light()
+            self.ink(ThemeMode::Light)
         } else {
-            Self::dark()
+            self.ink(ThemeMode::Dark)
         };
         self.with_ink_of(foreground)
     }
 
     /// Whether dark text reads better over `image` once the plate's own layers (glass layer,
-    /// opacity veil, tint wash) are composited over it. One colour for a whole fence (按栅栏自动)
-    /// judges by its darkest quarter: white text with its shadow survives pale sky far better
-    /// than dark text survives trees.
+    /// opacity veil, tint wash) are composited over it.
     fn prefers_dark_text(
         &self,
         image: &crate::Image,
@@ -340,7 +420,8 @@ impl Theme {
         tint: Option<ColorF>,
         previous_dark_text: Option<bool>,
     ) -> bool {
-        let mut samples = Vec::with_capacity(256);
+        let mut sum = 0.0;
+        let mut count = 0;
         let (cols, rows) = (image.width.min(16), image.height.min(16));
         for row in 0..rows {
             for col in 0..cols {
@@ -348,17 +429,12 @@ impl Theme {
                 let y = ((2 * row + 1) * image.height / (2 * rows)).min(image.height - 1);
                 let i = ((y * image.width + x) * 4) as usize;
                 let p = &image.bgra[i..i + 4];
-                samples.push(
-                    (0.2126 * p[2] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[0] as f32) / 255.0,
-                );
+                sum += (0.2126 * p[2] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[0] as f32) / 255.0;
+                count += 1;
             }
         }
-        if self.label_color == pecofence_core::LabelColor::PerFence {
-            samples.sort_by(f32::total_cmp);
-            samples.truncate(samples.len().div_ceil(4));
-        }
         let luminance = |c: ColorF| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-        let mut brightness = samples.iter().sum::<f32>() / samples.len().max(1) as f32;
+        let mut brightness = sum / count.max(1) as f32;
         let layer = if self.liquid_glass {
             self.liquid_level(opacity).fill
         } else {
@@ -386,29 +462,40 @@ impl Theme {
 
     /// The theme the text is drawn with. 「文字颜色」 白色 / 黑色 takes the text of this
     /// material's dark / light theme whatever the backdrop; the plate, hover and focus tokens
-    /// stay as picked for it. 按栅栏自动 is kept for the ink pickers to read.
+    /// stay as picked for it.
     pub fn with_label_color(mut self, color: pecofence_core::LabelColor) -> Self {
         self.label_color = color;
         let mode = match color {
-            pecofence_core::LabelColor::Auto | pecofence_core::LabelColor::PerFence => {
-                return self;
-            }
+            pecofence_core::LabelColor::Auto => return self,
             pecofence_core::LabelColor::White => ThemeMode::Dark,
             pecofence_core::LabelColor::Black => ThemeMode::Light,
         };
-        let mut ink = Self::for_mode(mode);
-        if self.liquid_glass {
-            ink = ink.with_liquid_glass();
-        }
+        let ink = self.ink(mode);
         self.text_primary = ink.text_primary;
         self.text_secondary = ink.text_secondary;
         self.text_tertiary = ink.text_tertiary;
         self
     }
 
+    /// The ink of this style's `mode` variant: a custom theme's own, else the built-in one.
+    fn ink(&self, mode: ThemeMode) -> Ink {
+        if let Some([light, dark]) = self.custom_inks {
+            return if mode == ThemeMode::Light {
+                light
+            } else {
+                dark
+            };
+        }
+        let mut theme = Self::for_mode(mode);
+        if self.liquid_glass {
+            theme = theme.with_liquid_glass();
+        }
+        Ink::of(&theme)
+    }
+
     /// Takes the text and control-feedback tokens of `foreground`; material, accent and
     /// geometry stay.
-    fn with_ink_of(mut self, foreground: Self) -> Self {
+    fn with_ink_of(mut self, foreground: Ink) -> Self {
         self.text_primary = foreground.text_primary;
         self.text_secondary = foreground.text_secondary;
         self.text_tertiary = foreground.text_tertiary;
@@ -716,27 +803,6 @@ mod tests {
         assert_eq!(lerp(a, b, 2.0), b);
         let h = with_alpha(ColorF::from_rgba8(1, 2, 3, 0x80), 0.5);
         assert!((h.a - 0x80 as f32 / 255.0 * 0.5).abs() < 1e-6);
-    }
-
-    #[test]
-    fn per_fence_text_judges_by_the_darkest_quarter() {
-        use pecofence_core::LabelColor;
-        for mode in [ThemeMode::Light, ThemeMode::Dark] {
-            let glass = Theme::for_mode(mode).with_liquid_glass();
-            let per_fence = glass.with_label_color(LabelColor::PerFence);
-            assert_eq!(per_fence.text_primary, glass.text_primary);
-            let bright = crate::Image::solid(16, 16, [240; 3]);
-            let dim = crate::Image::solid(16, 16, [20; 3]);
-            assert!(per_fence.over_glass(&bright).text_primary.r < 0.2);
-            assert!(per_fence.over_glass(&dim).text_primary.r > 0.9);
-            // Mostly sky with a band of trees: the average says dark text, the trees say white.
-            let mut mixed = crate::Image::solid(16, 16, [240; 3]);
-            for px in mixed.bgra.chunks_mut(4).skip(16 * 11) {
-                px[..3].copy_from_slice(&[30; 3]);
-            }
-            assert!(glass.over_glass(&mixed).text_primary.r < 0.2);
-            assert!(per_fence.over_glass(&mixed).text_primary.r > 0.9);
-        }
     }
 }
 #[test]
